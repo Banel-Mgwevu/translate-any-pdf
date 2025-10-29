@@ -1,0 +1,93 @@
+REQUIRED FILES AND FOLDERS CHECKLIST
+====================================
+
+Your installation directory MUST contain these items:
+
+REQUIRED FOLDERS (Essential - Program won't work without these):
+----------------------------------------------------------------
+☐ ooxml/                    ← Contains document processing code
+  ☐ ooxml/__init__.py
+  ☐ ooxml/document.py
+  ☐ ooxml/xmleditor.py
+  
+☐ scripts/                  ← Contains utility scripts
+  ☐ scripts/pack.py
+  ☐ scripts/unpack.py
+
+REQUIRED PYTHON FILES:
+----------------------
+☐ document_translator.py          ← Main program (CLI)
+☐ document_translator_gui.py      ← GUI version
+☐ fix_setup.py                    ← Setup checker
+☐ test_installation.py            ← Installation tester
+
+DOCUMENTATION:
+--------------
+☐ README.md
+☐ QUICKSTART.md
+☐ WINDOWS_TROUBLESHOOTING.md     ← Read this if you have errors!
+☐ INDEX.md
+☐ requirements.txt
+
+OPTIONAL FILES:
+---------------
+☐ create_sample_document.js       ← Creates test document
+☐ examples.py                     ← Code examples
+☐ sample_document.docx            ← Test document
+☐ check_setup.bat                 ← Windows setup checker
+
+HOW TO VERIFY YOUR INSTALLATION:
+=================================
+
+Windows Users:
+--------------
+1. Double-click: check_setup.bat
+   OR
+2. Run: python fix_setup.py
+
+Linux/Mac Users:
+----------------
+Run: python3 fix_setup.py
+
+COMMON PROBLEM:
+===============
+
+ERROR: ModuleNotFoundError: No module named 'ooxml'
+
+CAUSE: The ooxml/ folder is missing from your directory.
+
+SOLUTION:
+1. You must download ALL files, not just .py files
+2. Extract the complete archive/package
+3. Ensure ooxml/ and scripts/ folders are present
+4. Run check_setup.bat (Windows) to verify
+
+YOUR FOLDER STRUCTURE SHOULD LOOK LIKE THIS:
+=============================================
+
+your_folder/
+├── ooxml/                         ← MUST HAVE THIS FOLDER
+│   ├── __init__.py
+│   ├── document.py
+│   └── xmleditor.py
+├── scripts/                       ← MUST HAVE THIS FOLDER  
+│   ├── pack.py
+│   └── unpack.py
+├── document_translator.py
+├── document_translator_gui.py
+├── fix_setup.py
+├── test_installation.py
+├── requirements.txt
+├── README.md
+└── ... other files
+
+If you're missing the ooxml/ or scripts/ folders, the program WILL NOT WORK.
+
+QUICK FIX:
+==========
+1. Re-download the COMPLETE package
+2. Extract ALL files and folders
+3. Run: check_setup.bat (Windows) or python fix_setup.py
+4. Follow the instructions
+
+Need more help? Read: WINDOWS_TROUBLESHOOTING.md
