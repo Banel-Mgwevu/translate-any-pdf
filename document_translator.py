@@ -14,6 +14,7 @@ This application translates Word documents while maintaining:
 import sys
 import os
 import shutil
+import subprocess
 from googletrans import Translator
 from defusedxml import minidom as defused_minidom
 from xml.dom import minidom
@@ -23,6 +24,12 @@ import re
 # Add ooxml to path
 sys.path.insert(0, os.path.dirname(__file__))
 from ooxml.document import Document
+
+
+def get_python_executable():
+    """Get the correct Python executable for the current platform"""
+    # Try to use the same executable that's running this script
+    return sys.executable
 
 
 class DocumentTranslator:
@@ -150,16 +157,30 @@ class DocumentTranslator:
         print(f"{'='*60}\n")
         
         # Create temporary directory for unpacking
-        temp_dir = '/tmp/doc_translate_temp'
+        temp_dir = os.path.join(os.path.dirname(__file__), 'temp_translate')
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir)
         
         try:
+            # Get the correct Python executable
+            python_exe = get_python_executable()
+            
             # Unpack the document
             print("Step 1: Unpacking document...")
             unpack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'unpack.py')
-            os.system(f'python {unpack_script} "{input_docx}" "{temp_dir}"')
+            
+            result = subprocess.run(
+                [python_exe, unpack_script, input_docx, temp_dir],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                print(f"Error unpacking document: {result.stderr}")
+                raise Exception("Failed to unpack document")
+            
+            print(result.stdout)
             
             # Initialize Document object
             print("\nStep 2: Loading document structure...")
@@ -171,28 +192,30 @@ class DocumentTranslator:
             self.translate_xml_text_nodes(doc_xml.dom.documentElement)
             
             # Translate headers if they exist
-            header_files = [f for f in os.listdir(os.path.join(doc.unpacked_path, 'word'))
-                          if f.startswith('header') and f.endswith('.xml')]
-            
-            if header_files:
-                print("\nStep 4: Translating headers...")
-                for header_file in header_files:
-                    header_path = f'word/{header_file}'
-                    if header_path in doc.files:
-                        header_xml = doc[header_path]
-                        self.translate_xml_text_nodes(header_xml.dom.documentElement)
-            
-            # Translate footers if they exist
-            footer_files = [f for f in os.listdir(os.path.join(doc.unpacked_path, 'word'))
-                          if f.startswith('footer') and f.endswith('.xml')]
-            
-            if footer_files:
-                print("\nStep 5: Translating footers...")
-                for footer_file in footer_files:
-                    footer_path = f'word/{footer_file}'
-                    if footer_path in doc.files:
-                        footer_xml = doc[footer_path]
-                        self.translate_xml_text_nodes(footer_xml.dom.documentElement)
+            word_dir = os.path.join(doc.unpacked_path, 'word')
+            if os.path.exists(word_dir):
+                header_files = [f for f in os.listdir(word_dir)
+                              if f.startswith('header') and f.endswith('.xml')]
+                
+                if header_files:
+                    print("\nStep 4: Translating headers...")
+                    for header_file in header_files:
+                        header_path = f'word/{header_file}'
+                        if header_path in doc.files:
+                            header_xml = doc[header_path]
+                            self.translate_xml_text_nodes(header_xml.dom.documentElement)
+                
+                # Translate footers if they exist
+                footer_files = [f for f in os.listdir(word_dir)
+                              if f.startswith('footer') and f.endswith('.xml')]
+                
+                if footer_files:
+                    print("\nStep 5: Translating footers...")
+                    for footer_file in footer_files:
+                        footer_path = f'word/{footer_file}'
+                        if footer_path in doc.files:
+                            footer_xml = doc[footer_path]
+                            self.translate_xml_text_nodes(footer_xml.dom.documentElement)
             
             # Save the modified document
             print("\nStep 6: Saving translated document...")
@@ -201,7 +224,18 @@ class DocumentTranslator:
             # Pack the document
             print("\nStep 7: Packing translated document...")
             pack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'pack.py')
-            os.system(f'python {pack_script} "{temp_dir}" "{output_docx}"')
+            
+            result = subprocess.run(
+                [python_exe, pack_script, temp_dir, output_docx],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                print(f"Error packing document: {result.stderr}")
+                raise Exception("Failed to pack document")
+            
+            print(result.stdout)
             
             print(f"\n{'='*60}")
             print(f"Translation Complete!")
