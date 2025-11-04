@@ -1,0 +1,139 @@
+╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║         DOCUMENT TRANSLATOR - START HERE                   ║
+║         Translate DOCX files keeping structure & logos     ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝
+
+⚠️  IMPORTANT: READ THIS FIRST! ⚠️
+
+BEFORE YOU DO ANYTHING ELSE:
+=============================
+
+1. CHECK YOUR FILES
+   ----------------
+   Make sure you have THESE FOLDERS in this directory:
+   
+   ✓ ooxml/      (Contains essential code)
+   ✓ scripts/    (Contains utility scripts)
+   
+   WITHOUT THESE FOLDERS, THE PROGRAM WON'T WORK!
+
+2. VERIFY YOUR SETUP
+   ------------------
+   
+   Windows Users:
+   Double-click: check_setup.bat
+   
+   OR run in command prompt:
+   python fix_setup.py
+   
+   This will tell you if anything is missing.
+
+3. IF YOU GET "ModuleNotFoundError: No module named 'ooxml'"
+   ----------------------------------------------------------
+   
+   ❌ PROBLEM: You're missing the ooxml/ or scripts/ folders
+   
+   ✅ SOLUTION: 
+      - Re-download the COMPLETE package
+      - Extract ALL files and folders
+      - Don't just copy .py files!
+   
+   See: WINDOWS_TROUBLESHOOTING.md for detailed help
+
+═══════════════════════════════════════════════════════════
+
+QUICK START (After verifying files):
+====================================
+
+Step 1: Install Dependencies
+----------------------------
+pip install googletrans==4.0.0rc1 defusedxml
+
+Step 2: Choose Your Method
+---------------------------
+
+METHOD A - GUI (Easiest):
+   python document_translator_gui.py
+   Then use the visual interface
+
+METHOD B - Command Line:
+   python document_translator.py input.docx output.docx es
+   
+   Languages: es=Spanish, fr=French, de=German, etc.
+
+Step 3: Test Installation
+--------------------------
+python test_installation.py
+
+═══════════════════════════════════════════════════════════
+
+DOCUMENTATION FILES:
+===================
+
+🆘 Having Problems?
+   → WINDOWS_TROUBLESHOOTING.md  (Read this first!)
+   → FILE_CHECKLIST.txt          (What you should have)
+
+📚 Getting Started:
+   → QUICKSTART.md               (Quick 3-step guide)
+   → README.md                   (Complete documentation)
+   → VISUAL_GUIDE.md             (See how it works)
+
+🔧 Advanced:
+   → examples.py                 (Code examples)
+   → INDEX.md                    (All files reference)
+
+═══════════════════════════════════════════════════════════
+
+WHAT THIS PROGRAM DOES:
+=======================
+
+✓ Translates Word documents to 15+ languages
+✓ Keeps ALL formatting (bold, colors, fonts)
+✓ Preserves images and logos
+✓ Maintains tables and lists
+✓ Keeps company addresses and contact info
+✓ Preserves headers and footers
+✓ Maintains exact document structure
+
+═══════════════════════════════════════════════════════════
+
+MOST COMMON MISTAKES:
+=====================
+
+❌ MISTAKE 1: Missing ooxml/ folder
+   Solution: Download complete package, extract all
+
+❌ MISTAKE 2: Not installing dependencies
+   Solution: pip install googletrans==4.0.0rc1 defusedxml
+
+❌ MISTAKE 3: Wrong file format
+   Solution: Only .docx files work (not .doc)
+
+═══════════════════════════════════════════════════════════
+
+NEED HELP?
+==========
+
+1. Run: check_setup.bat (Windows) or python fix_setup.py
+2. Read: WINDOWS_TROUBLESHOOTING.md
+3. Check: FILE_CHECKLIST.txt
+
+═══════════════════════════════════════════════════════════
+
+READY TO START?
+===============
+
+Run this command to verify everything:
+   python fix_setup.py
+
+If everything is OK, run:
+   python document_translator_gui.py
+
+Or read QUICKSTART.md for detailed instructions.
+
+═══════════════════════════════════════════════════════════
+
+Questions? Check README.md for complete documentation.

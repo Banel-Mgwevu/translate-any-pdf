@@ -1,0 +1,149 @@
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║  FIX FOR: ModuleNotFoundError: No module named 'ooxml'       ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+
+YOU SAW THIS ERROR:
+==================
+Traceback (most recent call last):
+  File "...\document_translator.py", line 24, in <module>
+    from ooxml.document import Document
+ModuleNotFoundError: No module named 'ooxml'
+
+
+WHAT THIS MEANS:
+================
+The 'ooxml' folder is missing from your directory. This folder contains
+essential code that the translator needs to work.
+
+
+THE PROBLEM:
+============
+When you downloaded/extracted the files, you got the .py files but NOT
+the ooxml/ and scripts/ folders. Without these folders, nothing will work.
+
+
+THE SOLUTION:
+=============
+
+STEP 1: Check What You Have
+----------------------------
+Open your folder in File Explorer:
+C:\Users\X\Desktop\translator_ai\files\
+
+You should see:
+✓ ooxml\ (folder)           ← Is this there?
+✓ scripts\ (folder)         ← Is this there?
+✓ document_translator.py
+✓ document_translator_gui.py
+✓ Other .py and .md files
+
+If ooxml\ or scripts\ folders are MISSING, continue to Step 2.
+
+
+STEP 2: Get the Missing Folders
+--------------------------------
+
+Option A - Quick Check (Recommended):
+   1. Run this in PowerShell/Command Prompt:
+      check_setup.bat
+   
+   2. It will tell you exactly what's missing
+
+Option B - Manual Fix:
+   You need to re-download the COMPLETE package that includes:
+   - All .py files
+   - The ooxml/ folder (with __init__.py, document.py, xmleditor.py)
+   - The scripts/ folder (with pack.py, unpack.py)
+   
+   Make sure when extracting:
+   - Extract ALL files
+   - Don't just copy individual files
+   - Folders must be preserved
+
+
+STEP 3: Verify the Fix
+-----------------------
+After getting the folders, run:
+
+PowerShell:
+   python fix_setup.py
+
+This will check everything and tell you if it's correct.
+
+
+STEP 4: Try Again
+-----------------
+Once fix_setup.py says everything is OK, try:
+
+   python document_translator.py sample_document.docx output.docx es
+
+Or use the GUI:
+   python document_translator_gui.py
+
+
+QUICK VERIFICATION:
+===================
+
+Run these commands in order:
+
+1. dir ooxml
+   Should show: __init__.py, document.py, xmleditor.py
+   
+2. dir scripts  
+   Should show: pack.py, unpack.py
+   
+3. python fix_setup.py
+   Should say: "ALL REQUIRED FILES FOUND!"
+
+
+IF FOLDERS ARE STILL MISSING:
+==============================
+
+The ooxml and scripts folders contain the actual translation engine.
+Without them, only the "wrapper" code exists.
+
+You must obtain these folders from the complete download package.
+
+Where to find them:
+- They should be in the same download/package as the .py files
+- If you only have .py files, you don't have the complete package
+- Re-download from the source where you got the files
+
+
+YOUR CURRENT SITUATION:
+=======================
+
+Based on your error, you have:
+✓ document_translator.py (the main file)
+✓ Python dependencies installed (googletrans, etc.)
+✓ Correct Python version
+
+But you're missing:
+✗ ooxml/ folder
+✗ scripts/ folder
+
+These folders are ESSENTIAL. Get them, and everything will work.
+
+
+STILL STUCK?
+============
+
+1. Run: check_setup.bat
+2. Read: WINDOWS_TROUBLESHOOTING.md (detailed help)
+3. Check: FILE_CHECKLIST.txt (list of required files)
+
+The check_setup.bat will give you a clear yes/no on whether you have
+everything needed.
+
+
+═══════════════════════════════════════════════════════════════
+
+Bottom Line:
+- You need the ooxml/ and scripts/ folders
+- They must be in the same directory as document_translator.py
+- Run check_setup.bat to verify
+- Once verified, the program will work
+
+═══════════════════════════════════════════════════════════════

@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+Document Translator - Translate DOCX documents while preserving structure, formatting, and images
+
+This application translates Word documents while maintaining:
+- Document structure and layout
+- Text formatting (bold, italic, colors, fonts)
+- Images and logos
+- Tables and lists
+- Headers and footers
+- Addresses and other elements
+"""
+
+import sys
+import os
+import shutil
+from googletrans import Translator
+from defusedxml import minidom
+import time
+import re
+
+# Add ooxml to path
+sys.path.insert(0, os.path.dirname(__file__))
+from ooxml.document import Document
+
+
+class DocumentTranslator:
+    """Translates DOCX documents while preserving structure"""
+    
+    def __init__(self, source_lang='auto', target_lang='es'):
+        """
+        Initialize the translator
+        
+        Args:
+            source_lang: Source language code (default: 'auto' for auto-detect)
+            target_lang: Target language code (default: 'es' for Spanish)
+        """
+        self.translator = Translator()
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.translation_cache = {}
+        
+    def translate_text(self, text):
+        """
+        Translate text with caching to avoid duplicate translations
+        
+        Args:
+            text: Text to translate
+            
+        Returns:
+            Translated text
+        """
+        if not text or not text.strip():
+            return text
+            
+        # Check cache first
+        if text in self.translation_cache:
+            return self.translation_cache[text]
+        
+        try:
+            # Add small delay to avoid rate limiting
+            time.sleep(0.1)
+            
+            result = self.translator.translate(
+                text,
+                src=self.source_lang,
+                dest=self.target_lang
+            )
+            
+            translated = result.text
+            self.translation_cache[text] = translated
+            
+            return translated
+            
+        except Exception as e:
+            print(f"Warning: Translation failed for '{text[:50]}...': {e}")
+            return text
+    
+    def should_translate_node(self, node):
+        """
+        Determine if a node's text should be translated
+        
+        Some elements like email addresses, URLs, or pure numbers
+        should not be translated
+        
+        Args:
+            node: XML node to check
+            
+        Returns:
+            Boolean indicating if node should be translated
+        """
+        if node.nodeType != minidom.Node.TEXT_NODE:
+            return False
+            
+        text = node.nodeValue.strip()
+        
+        if not text:
+            return False
+        
+        # Don't translate email addresses
+        if '@' in text and '.' in text:
+            return False
+        
+        # Don't translate URLs
+        if text.startswith('http://') or text.startswith('https://') or text.startswith('www.'):
+            return False
+        
+        # Don't translate pure numbers or dates in simple format
+        if re.match(r'^[\d\s\-/.,]+$', text):
+            return False
+            
+        return True
+    
+    def translate_xml_text_nodes(self, node):
+        """
+        Recursively translate all text nodes in an XML structure
+        
+        Args:
+            node: XML node to process
+        """
+        # Process text nodes
+        if node.nodeType == minidom.Node.TEXT_NODE:
+            if self.should_translate_node(node):
+                original = node.nodeValue
+                translated = self.translate_text(original)
+                node.nodeValue = translated
+                print(f"  Translated: '{original[:50]}...' -> '{translated[:50]}...'")
+        
+        # Recursively process child nodes
+        if node.hasChildNodes():
+            for child in list(node.childNodes):
+                self.translate_xml_text_nodes(child)
+    
+    def translate_document(self, input_docx, output_docx):
+        """
+        Translate a DOCX document
+        
+        Args:
+            input_docx: Path to input DOCX file
+            output_docx: Path to output DOCX file
+        """
+        print(f"\n{'='*60}")
+        print(f"Document Translator")
+        print(f"{'='*60}")
+        print(f"Input:  {input_docx}")
+        print(f"Output: {output_docx}")
+        print(f"Source Language: {self.source_lang}")
+        print(f"Target Language: {self.target_lang}")
+        print(f"{'='*60}\n")
+        
+        # Create temporary directory for unpacking
+        temp_dir = '/tmp/doc_translate_temp'
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+        
+        try:
+            # Unpack the document
+            print("Step 1: Unpacking document...")
+            unpack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'unpack.py')
+            os.system(f'python {unpack_script} "{input_docx}" "{temp_dir}"')
+            
+            # Initialize Document object
+            print("\nStep 2: Loading document structure...")
+            doc = Document(temp_dir)
+            
+            # Translate main document content
+            print("\nStep 3: Translating main document content...")
+            doc_xml = doc['word/document.xml']
+            self.translate_xml_text_nodes(doc_xml.dom.documentElement)
+            
+            # Translate headers if they exist
+            header_files = [f for f in os.listdir(os.path.join(doc.unpacked_path, 'word'))
+                          if f.startswith('header') and f.endswith('.xml')]
+            
+            if header_files:
+                print("\nStep 4: Translating headers...")
+                for header_file in header_files:
+                    header_path = f'word/{header_file}'
+                    if header_path in doc.files:
+                        header_xml = doc[header_path]
+                        self.translate_xml_text_nodes(header_xml.dom.documentElement)
+            
+            # Translate footers if they exist
+            footer_files = [f for f in os.listdir(os.path.join(doc.unpacked_path, 'word'))
+                          if f.startswith('footer') and f.endswith('.xml')]
+            
+            if footer_files:
+                print("\nStep 5: Translating footers...")
+                for footer_file in footer_files:
+                    footer_path = f'word/{footer_file}'
+                    if footer_path in doc.files:
+                        footer_xml = doc[footer_path]
+                        self.translate_xml_text_nodes(footer_xml.dom.documentElement)
+            
+            # Save the modified document
+            print("\nStep 6: Saving translated document...")
+            doc.save()
+            
+            # Pack the document
+            print("\nStep 7: Packing translated document...")
+            pack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'pack.py')
+            os.system(f'python {pack_script} "{temp_dir}" "{output_docx}"')
+            
+            print(f"\n{'='*60}")
+            print(f"Translation Complete!")
+            print(f"{'='*60}")
+            print(f"Translated {len(self.translation_cache)} unique text segments")
+            print(f"Output saved to: {output_docx}")
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"\nError during translation: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        finally:
+            # Cleanup temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+
+def main():
+    """Main entry point for the application"""
+    
+    if len(sys.argv) < 3:
+        print("Document Translator - Translate DOCX while preserving structure")
+        print("\nUsage:")
+        print("  python document_translator.py <input.docx> <output.docx> [target_lang] [source_lang]")
+        print("\nExamples:")
+        print("  python document_translator.py document.docx translated.docx es")
+        print("  python document_translator.py document.docx translated.docx fr en")
+        print("\nCommon language codes:")
+        print("  en - English")
+        print("  es - Spanish")
+        print("  fr - French")
+        print("  de - German")
+        print("  it - Italian")
+        print("  pt - Portuguese")
+        print("  ru - Russian")
+        print("  zh-cn - Chinese (Simplified)")
+        print("  ja - Japanese")
+        print("  ko - Korean")
+        print("  ar - Arabic")
+        print("\nFeatures:")
+        print("  ✓ Preserves document structure and formatting")
+        print("  ✓ Keeps images and logos intact")
+        print("  ✓ Maintains tables, lists, and styles")
+        print("  ✓ Preserves headers and footers")
+        print("  ✓ Skips emails, URLs, and pure numbers")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+    target_lang = sys.argv[3] if len(sys.argv) > 3 else 'es'
+    source_lang = sys.argv[4] if len(sys.argv) > 4 else 'auto'
+    
+    # Validate input file
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' not found")
+        sys.exit(1)
+    
+    if not input_file.endswith('.docx'):
+        print("Error: Input file must be a .docx file")
+        sys.exit(1)
+    
+    # Create translator and translate document
+    translator = DocumentTranslator(source_lang=source_lang, target_lang=target_lang)
+    translator.translate_document(input_file, output_file)
+
+
+if __name__ == '__main__':
+    main()
