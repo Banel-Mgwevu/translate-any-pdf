@@ -23,7 +23,8 @@
 
 # Core translation and language tools
 # Core translation and language tools
-googletrans==4.0.0rc1
+# Core translation and language tools
+googletrans==3.1.0a0
 sacrebleu==2.3.1
 nltk==3.8.1
 
