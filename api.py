@@ -67,14 +67,28 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# Add CORS middleware
+# ============================================
+# CORS CONFIGURATION - UPDATED FOR RENDER
+# ============================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"],
+    allow_origins=[
+        # Local development
+        "http://localhost:5173",  # Local Vite dev server
+        "http://127.0.0.1:5173",  # Local Vite dev server (alternate)
+        "http://localhost:3000",  # Local React dev server
+        "http://localhost:4173",  # Local Vite preview
+        # Production on Render
+        "https://translation-app-frontend-lhk5.onrender.com",  # Production frontend on Render
+        "https://translate-any-pdf.onrender.com",  # Production backend on Render (self-requests)
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all HTTP methods
+    allow_headers=["*"],  # Allows all headers
 )
+# ============================================
+# END CORS CONFIGURATION
+# ============================================
 
 # Security
 security = HTTPBearer()
