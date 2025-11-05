@@ -59,10 +59,16 @@ class DocumentTranslator:
             source_lang: Source language code (default: 'auto' for auto-detect)
             target_lang: Target language code (default: 'es' for Spanish)
         """
-        self.translator = Translator()
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.translation_cache = {}
+        
+        # Initialize the deep-translator instance
+        try:
+            self.translator = GoogleTranslator(source=source_lang, target=target_lang)
+        except Exception as e:
+            print(f"Warning: Failed to initialize translator: {e}")
+            self.translator = None
         
     def translate_text(self, text):
         """
@@ -85,19 +91,23 @@ class DocumentTranslator:
             # Add small delay to avoid rate limiting
             time.sleep(0.1)
             
-            result = self.translator.translate(
-                text,
-                src=self.source_lang,
-                dest=self.target_lang
-            )
+            # deep-translator returns the translated text directly
+            if self.translator is None:
+                # Reinitialize if needed
+                self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
             
-            translated = result.text
+            translated = self.translator.translate(text)
             self.translation_cache[text] = translated
             
             return translated
             
         except Exception as e:
             print(f"Warning: Translation failed for '{text[:50]}...': {e}")
+            # Try to recreate translator in case of connection issues
+            try:
+                self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
+            except:
+                pass
             return text
     
     def should_translate_text(self, text):
