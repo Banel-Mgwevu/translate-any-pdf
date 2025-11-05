@@ -16,7 +16,7 @@ import sys
 import os
 import shutil
 import subprocess
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from defusedxml import minidom as defused_minidom
 from xml.dom import minidom
 import time

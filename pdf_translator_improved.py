@@ -12,7 +12,7 @@ from pathlib import Path
 import time
 
 # Translation support
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 
 # PDF to DOCX conversion
 try:

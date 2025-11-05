@@ -29,7 +29,8 @@
 # Core translation and language tools
 # Core translation and language tools
 # Core translation and language tools
-googletrans==3.1.0a0
+# Core translation and language tools (Python 3.13 compatible)
+deep-translator==1.11.4  # Alternative to googletrans
 sacrebleu==2.3.1
 nltk==3.8.1
 

@@ -14,7 +14,7 @@ This application translates Word documents while maintaining:
 import sys
 import os
 import shutil
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from defusedxml import minidom
 import time
 import re

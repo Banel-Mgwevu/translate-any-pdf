@@ -107,7 +107,7 @@ def test_simple_translation():
     print("\nTesting simple translation...")
     
     try:
-        from googletrans import Translator
+        from deep_translator import GoogleTranslator
         translator = Translator()
         
         # Test translation
