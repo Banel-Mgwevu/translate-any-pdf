@@ -87,28 +87,51 @@ class DocumentTranslator:
         if text in self.translation_cache:
             return self.translation_cache[text]
         
-        try:
-            # Add small delay to avoid rate limiting
-            time.sleep(0.1)
-            
-            # deep-translator returns the translated text directly
-            if self.translator is None:
-                # Reinitialize if needed
-                self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
-            
-            translated = self.translator.translate(text)
-            self.translation_cache[text] = translated
-            
-            return translated
-            
-        except Exception as e:
-            print(f"Warning: Translation failed for '{text[:50]}...': {e}")
-            # Try to recreate translator in case of connection issues
+        # Retry logic for robustness
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
-            except:
-                pass
-            return text
+                # Add delay to avoid rate limiting (increase with retries)
+                time.sleep(0.15 * (attempt + 1))
+                
+                # Reinitialize translator if needed
+                if self.translator is None:
+                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
+                
+                # Translate - deep-translator returns string directly
+                translated = self.translator.translate(text)
+                
+                # Handle None or empty returns
+                if translated is None or not translated:
+                    print(f"Warning: Translation returned None for '{text[:50]}...', using original text")
+                    translated = text
+                
+                # Validate the result is a string
+                if not isinstance(translated, str):
+                    print(f"Warning: Translation returned non-string type, using original text")
+                    translated = text
+                
+                self.translation_cache[text] = translated
+                return translated
+                
+            except Exception as e:
+                print(f"Warning: Translation attempt {attempt + 1}/{max_retries} failed for '{text[:50]}...': {e}")
+                
+                # On last retry, return original text
+                if attempt == max_retries - 1:
+                    print(f"All retries exhausted, using original text")
+                    self.translation_cache[text] = text
+                    return text
+                
+                # Try to recreate translator for next attempt
+                try:
+                    time.sleep(0.5)  # Longer delay before retry
+                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
+                except Exception as recreate_error:
+                    print(f"Failed to recreate translator: {recreate_error}")
+                    
+        # Fallback (should never reach here, but just in case)
+        return text
     
     def should_translate_text(self, text):
         """
