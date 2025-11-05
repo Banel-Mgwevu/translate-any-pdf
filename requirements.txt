@@ -26,22 +26,22 @@
 # Core translation and language tools
 # Core translation and language tools
 # Core translation and language tools
+# Core translation and language tools
 googletrans==3.1.0a0
 sacrebleu==2.3.1
 nltk==3.8.1
 
-# Web server and API
-fastapi==0.100.0
-uvicorn[standard]==0.23.0
-python-multipart==0.0.6
-pydantic==1.10.12
-email-validator
+# Web server and API (Python 3.11 compatible)
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+pydantic==2.6.3
+email-validator==2.1.0
 defusedxml>=0.7.1
 
 # Document handling
 python-docx>=0.8.11
-PyMuPDF
-pypdf
-reportlab
+PyMuPDF>=1.23.0
+pypdf>=3.17.0
+reportlab>=4.0.0
 pdf2docx>=0.5.6
-
