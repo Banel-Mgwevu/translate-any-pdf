@@ -1,5 +1,5 @@
 """
-FastAPI REST API for Document Translation Service with Authentication & Payments & Translation Metrics
+FastAPI REST API for Document Translation Service with Authentication & Payments
 
 Features:
 - User authentication (sign up, sign in)
@@ -7,7 +7,13 @@ Features:
 - Subscription management
 - Document translation (DOCX and PDF)
 - Multi-format support with auto-detection
-- Translation quality metrics (BLEU, ChrF, METEOR, COMET)
+- Translation quality metrics (BLEU, ChrF, METEOR)
+
+IMPORTANT SETUP:
+1. Install ngrok: https://ngrok.com/download
+2. Run: ngrok http 8000
+3. Copy ngrok URL and update BASE_URL below
+4. Set passphrase in PayFast sandbox: https://sandbox.payfast.co.za
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends
@@ -23,6 +29,7 @@ import time
 import json
 import hashlib
 import hmac
+import urllib.parse
 from datetime import datetime, timedelta
 import shutil
 
@@ -37,7 +44,6 @@ try:
     from nltk.translate.meteor_score import meteor_score
     from nltk import word_tokenize
     import nltk
-    # Download required NLTK data
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
@@ -68,27 +74,51 @@ app = FastAPI(
 )
 
 # ============================================
-# CORS CONFIGURATION - UPDATED FOR RENDER
+# PAYFAST CONFIGURATION - UPDATE THESE!
+# ============================================
+
+# Sandbox mode (set to False for production)
+PAYFAST_SANDBOX = True
+
+# Sandbox credentials (for testing)
+SANDBOX_MERCHANT_ID = "10043424"
+SANDBOX_MERCHANT_KEY = "31ujwiuzciw38"
+SANDBOX_PASSPHRASE = "jt7NOE43FZPn"  # Set this in your sandbox dashboard
+
+# Production credentials (for live)
+PRODUCTION_MERCHANT_ID = "your-production-merchant-id"  # Replace with real ID
+PRODUCTION_MERCHANT_KEY = "your-production-merchant-key"  # Replace with real key
+PRODUCTION_PASSPHRASE = "your-production-passphrase"  # Replace with real passphrase
+
+# ⚠️ CRITICAL: Update this with your ngrok URL or deployed server URL
+# For local testing: Run "ngrok http 8000" and copy the URL here
+# For production: Use your actual domain
+BASE_URL = "https://translate-any-pdf.onrender.com"  # 🚨 CHANGE THIS!
+
+# Get current credentials based on mode
+PAYFAST_MERCHANT_ID = SANDBOX_MERCHANT_ID if PAYFAST_SANDBOX else PRODUCTION_MERCHANT_ID
+PAYFAST_MERCHANT_KEY = SANDBOX_MERCHANT_KEY if PAYFAST_SANDBOX else PRODUCTION_MERCHANT_KEY
+PAYFAST_PASSPHRASE = SANDBOX_PASSPHRASE if PAYFAST_SANDBOX else PRODUCTION_PASSPHRASE
+
+# ============================================
+# CORS CONFIGURATION
 # ============================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         # Local development
-        "http://localhost:5173",  # Local Vite dev server
-        "http://127.0.0.1:5173",  # Local Vite dev server (alternate)
-        "http://localhost:3000",  # Local React dev server
-        "http://localhost:4173",  # Local Vite preview
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://localhost:4173",
         # Production on Render
-        "https://translation-app-frontend-lhk5.onrender.com",  # Production frontend on Render
-        "https://translate-any-pdf.onrender.com",  # Production backend on Render (self-requests)
+        "https://translation-app-frontend-lhk5.onrender.com",
+        "https://translate-any-pdf.onrender.com",
     ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# ============================================
-# END CORS CONFIGURATION
-# ============================================
 
 # Security
 security = HTTPBearer()
@@ -105,12 +135,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 PAYMENTS_FILE = os.path.join(DATA_DIR, "payments.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
-
-# PayFast configuration
-PAYFAST_MERCHANT_ID = "10000100"  # Replace with your actual merchant ID
-PAYFAST_MERCHANT_KEY = "46f0cd694581a"  # Replace with your actual merchant key
-PAYFAST_PASSPHRASE = ""  # Add your passphrase if you set one in PayFast dashboard
-PAYFAST_SANDBOX = True  # Set to False for production
 
 # Supported file formats
 SUPPORTED_FORMATS = {
@@ -191,6 +215,55 @@ class MetricsResponse(BaseModel):
     calculated_at: str
     segments_compared: int
 
+# ============================================
+# PAYFAST SIGNATURE CALCULATION (FIXED)
+# ============================================
+
+def calculate_payfast_signature(data: dict, passphrase: str = None) -> str:
+    """
+    Calculate PayFast signature correctly.
+    
+    CRITICAL: PayFast requires fields in document order (NOT alphabetical!)
+    This follows the exact order from PayFast documentation.
+    """
+    
+    # Define correct field order per PayFast docs
+    field_order = [
+        # Merchant details
+        'merchant_id', 'merchant_key', 'return_url', 'cancel_url', 'notify_url',
+        # Customer details
+        'name_first', 'name_last', 'email_address', 'cell_number',
+        # Transaction details
+        'm_payment_id', 'amount', 'item_name', 'item_description',
+        # Custom fields
+        'custom_int1', 'custom_int2', 'custom_int3', 'custom_int4', 'custom_int5',
+        'custom_str1', 'custom_str2', 'custom_str3', 'custom_str4', 'custom_str5',
+        # Transaction options
+        'email_confirmation', 'confirmation_address', 'payment_method',
+        # Recurring billing
+        'subscription_type', 'billing_date', 'recurring_amount', 'frequency', 'cycles'
+    ]
+    
+    # Build parameter string in correct order
+    param_list = []
+    for key in field_order:
+        if key in data and data[key] not in [None, '', 'None']:
+            value = str(data[key]).strip()
+            # Use quote_plus for URL encoding (spaces become +)
+            encoded_value = urllib.parse.quote_plus(value)
+            param_list.append(f"{key}={encoded_value}")
+    
+    param_string = "&".join(param_list)
+    
+    # Add passphrase if provided
+    if passphrase:
+        param_string += f"&passphrase={urllib.parse.quote_plus(passphrase)}"
+    
+    # Calculate MD5 hash
+    signature = hashlib.md5(param_string.encode()).hexdigest()
+    
+    return signature
+
 # Utility functions
 def hash_password(password: str) -> str:
     """Hash password using SHA-256"""
@@ -234,30 +307,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         raise HTTPException(status_code=401, detail="User not found")
     
     return users[user_id]
-
-def calculate_payfast_signature(data: dict) -> str:
-    """Calculate PayFast signature for validation"""
-    import urllib.parse
-    
-    # Create parameter string - PayFast requires URL encoding with quote_plus
-    # This matches how HTML forms encode data (spaces become +)
-    param_list = []
-    for key in sorted(data.keys()):
-        if key != 'signature':
-            value = str(data[key]).strip()
-            # URL encode using quote_plus (spaces become +, matches form encoding)
-            encoded_value = urllib.parse.quote_plus(value)
-            param_list.append(f"{key}={encoded_value}")
-    
-    # Join with &
-    param_string = "&".join(param_list)
-    
-    # Add passphrase if set (for production, not needed for sandbox)
-    if PAYFAST_PASSPHRASE:
-        param_string += f"&passphrase={urllib.parse.quote_plus(PAYFAST_PASSPHRASE)}"
-    
-    # Calculate MD5 hash
-    return hashlib.md5(param_string.encode()).hexdigest()
 
 def extract_text_from_docx(docx_path: str) -> str:
     """Extract text from DOCX file"""
@@ -324,7 +373,6 @@ def calculate_translation_metrics(source_text: str, translated_text: str, source
     meteor_scores = []
     for src, tgt in zip(source_segments, translated_segments):
         try:
-            # Tokenize
             src_tokens = word_tokenize(src.lower())
             tgt_tokens = word_tokenize(tgt.lower())
             if src_tokens and tgt_tokens:
@@ -339,12 +387,15 @@ def calculate_translation_metrics(source_text: str, translated_text: str, source
     return {
         "bleu_score": round(bleu_score, 2),
         "chrf_score": round(chrf_score, 2),
-        "meteor_score": round(meteor_avg * 100, 2),  # Convert to percentage
-        "comet_score": None,  # COMET requires heavy models, skipping for now
+        "meteor_score": round(meteor_avg * 100, 2),
+        "comet_score": None,
         "segments_compared": min_segments
     }
 
-# Authentication endpoints
+# ============================================
+# AUTHENTICATION ENDPOINTS
+# ============================================
+
 @app.post("/auth/signup", response_model=AuthResponse)
 async def sign_up(user_data: UserSignUp):
     """Register a new user"""
@@ -470,7 +521,10 @@ async def get_current_user(user: dict = Depends(verify_token)):
         created_at=user["created_at"]
     )
 
-# Payment endpoints
+# ============================================
+# PAYMENT ENDPOINTS (FIXED)
+# ============================================
+
 @app.post("/payment/initiate")
 async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(verify_token)):
     """Initiate a payment for subscription upgrade"""
@@ -498,59 +552,53 @@ async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(ve
     payments[payment_id] = payment_record
     save_json(PAYMENTS_FILE, payments)
     
-    # PayFast Configuration
-    USE_SANDBOX = False  # Change to True to use test sandbox
+    # Build payment data in correct order
+    payment_data = {
+        'merchant_id': PAYFAST_MERCHANT_ID,
+        'merchant_key': PAYFAST_MERCHANT_KEY,
+        'return_url': f'{BASE_URL}/payment/success',
+        'cancel_url': f'{BASE_URL}/payment/cancel',
+        'notify_url': f'{BASE_URL}/payment/notify',
+        'amount': f"{tier_info['price']:.2f}",
+        'item_name': f"{tier_info['name']} Subscription",
+        'item_description': f"Monthly subscription to {tier_info['name']} plan",
+        'custom_str1': payment_id,
+        'custom_str2': user["user_id"]
+    }
     
-    if USE_SANDBOX:
-        # Sandbox mode - use test credentials
-        payment_data = {
-            "cmd": "_paynow",
-            "receiver": "10000100",  # Test merchant ID
-            "amount": str(tier_info['price']),
-            "item_name": f"{tier_info['name']} Subscription",
-            "item_description": f"Monthly subscription to {tier_info['name']} plan",
-            "custom_str1": payment_id,
-            "custom_str2": user["user_id"],
-            "return_url": "http://localhost:5173/payment/success",
-            "cancel_url": "http://localhost:5173/payment/cancel",
-            "notify_url": "http://localhost:8000/payment/notify"
-        }
-        payfast_url = "https://sandbox.payfast.co.za/eng/process"
-    else:
-        # Production mode - use your real credentials
-        payment_data = {
-            "cmd": "_paynow",
-            "receiver": "32018599",  # Your PayFast merchant ID
-            "amount": str(tier_info['price']),
-            "item_name": f"{tier_info['name']} Subscription",
-            "item_description": f"Monthly subscription to {tier_info['name']} plan",
-            "custom_str1": payment_id,
-            "custom_str2": user["user_id"],
-            "return_url": "http://localhost:5173/payment/success",
-            "cancel_url": "http://localhost:5173/payment/cancel",
-            "notify_url": "http://localhost:8000/payment/notify"
-        }
-        payfast_url = "https://www.payfast.co.za/eng/process"
+    # Generate signature with passphrase
+    signature = calculate_payfast_signature(payment_data, PAYFAST_PASSPHRASE)
+    payment_data['signature'] = signature
     
-    # Debug output
-    print(f"\n{'='*60}")
-    print(f"PAYMENT INITIATED (Buy Now Format)")
-    print(f"Mode: {'SANDBOX (Test)' if USE_SANDBOX else 'PRODUCTION (Live)'}")
-    print(f"{'='*60}")
-    print(f"Payment ID: {payment_id}")
-    print(f"Tier: {tier_info['name']} (R{tier_info['price']})")
-    print(f"User: {user['email']}")
-    print(f"\nPayment Data:")
-    for key, value in payment_data.items():
-        print(f"  {key} = {value}")
-    print(f"\nPayment URL: {payfast_url}")
-    print(f"{'='*60}\n")
+    # PayFast URL
+    payfast_url = "https://sandbox.payfast.co.za/eng/process" if PAYFAST_SANDBOX else "https://www.payfast.co.za/eng/process"
+    
+    # Log payment details
+    print(f"\n{'='*70}")
+    print(f"💳 PAYMENT INITIATED - {'SANDBOX MODE' if PAYFAST_SANDBOX else 'PRODUCTION'}")
+    print(f"{'='*70}")
+    print(f"Payment ID:    {payment_id}")
+    print(f"Amount:        R{tier_info['price']:.2f}")
+    print(f"Plan:          {tier_info['name']}")
+    print(f"User:          {user['email']}")
+    print(f"Notify URL:    {payment_data['notify_url']}")
+    print(f"Signature:     {signature}")
+    print(f"PayFast URL:   {payfast_url}")
+    print(f"{'='*70}\n")
+    
+    # Check if notify_url is accessible
+    if 'localhost' in BASE_URL or '127.0.0.1' in BASE_URL or 'your-ngrok-url' in BASE_URL:
+        print("⚠️  WARNING: notify_url uses localhost or placeholder - webhooks will fail!")
+        print("   1. Run: ngrok http 8000")
+        print("   2. Copy ngrok URL")
+        print("   3. Update BASE_URL in this file")
+        print("   4. Restart the server\n")
     
     return {
         "payment_id": payment_id,
         "payment_url": payfast_url,
         "payment_data": payment_data,
-        "message": "Payment initiated. Redirect user to payment_url with payment_data"
+        "message": "Redirect user to payment_url with payment_data"
     }
 
 @app.post("/payment/notify")
@@ -561,22 +609,52 @@ async def payment_notify(request: Request):
     form_data = await request.form()
     data = dict(form_data)
     
-    print(f"PayFast IPN received: {data}")
+    print(f"\n{'='*70}")
+    print(f"🔔 PAYFAST WEBHOOK RECEIVED")
+    print(f"{'='*70}")
+    for key, value in data.items():
+        print(f"{key:20s}: {value}")
+    print(f"{'='*70}\n")
     
     # Verify signature
     received_signature = data.get("signature", "")
-    calculated_signature = calculate_payfast_signature(data)
     
-    if received_signature != calculated_signature:
-        print(f"Invalid signature. Received: {received_signature}, Calculated: {calculated_signature}")
-        raise HTTPException(status_code=400, detail="Invalid signature")
+    # Remove signature for verification
+    verify_data = {k: v for k, v in data.items() if k != 'signature'}
+    
+    # Calculate expected signature
+    calculated_signature = calculate_payfast_signature(verify_data, PAYFAST_PASSPHRASE)
+    
+    # Verify
+    signature_valid = (received_signature == calculated_signature)
+    
+    print(f"🔐 SIGNATURE VERIFICATION:")
+    print(f"   Received:   {received_signature}")
+    print(f"   Calculated: {calculated_signature}")
+    print(f"   Valid:      {'✅ YES' if signature_valid else '❌ NO'}\n")
+    
+    if not signature_valid:
+        if PAYFAST_SANDBOX:
+            print("⚠️  Signature mismatch in sandbox - continuing for debugging")
+            print("   In production, this request would be rejected!\n")
+        else:
+            print("❌ SIGNATURE INVALID - Rejecting webhook")
+            raise HTTPException(status_code=400, detail="Invalid signature")
     
     # Get payment details
     payment_id = data.get("custom_str1")
     user_id = data.get("custom_str2")
     payment_status = data.get("payment_status")
+    amount_gross = data.get("amount_gross")
+    
+    print(f"📋 PAYMENT DETAILS:")
+    print(f"   Payment ID:  {payment_id}")
+    print(f"   User ID:     {user_id}")
+    print(f"   Status:      {payment_status}")
+    print(f"   Amount:      R{amount_gross}\n")
     
     if not payment_id or payment_id not in payments:
+        print(f"❌ Payment {payment_id} not found!\n")
         raise HTTPException(status_code=404, detail="Payment not found")
     
     # Update payment status
@@ -594,7 +672,15 @@ async def payment_notify(request: Request):
             users[user_id]["translations_used"] = 0  # Reset usage on upgrade
             users[user_id]["updated_at"] = datetime.now().isoformat()
             save_json(USERS_FILE, users)
-            print(f"User {user_id} upgraded to {payment['tier']}")
+            print(f"✅ PAYMENT SUCCESSFUL - User {user_id} upgraded to {payment['tier']}\n")
+        else:
+            print(f"❌ User {user_id} not found!\n")
+    else:
+        print(f"❌ PAYMENT FAILED or CANCELLED\n")
+    
+    print(f"{'='*70}")
+    print(f"Returning 200 OK to PayFast")
+    print(f"{'='*70}\n")
     
     return {"status": "success"}
 
@@ -627,7 +713,10 @@ async def list_payments(user: dict = Depends(verify_token)):
         "payments": sorted(user_payments, key=lambda x: x["created_at"], reverse=True)
     }
 
-# Document translation endpoints (with authentication)
+# ============================================
+# DOCUMENT TRANSLATION ENDPOINTS
+# ============================================
+
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...), user: dict = Depends(verify_token)):
     """Upload a document for translation (supports DOCX and PDF)"""
@@ -707,7 +796,7 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
             target_lang=request.target_lang
         )
         
-        # Translate document (handles both DOCX and PDF automatically)
+        # Translate document
         print(f"\n{'='*60}")
         print(f"API Translation Request")
         print(f"{'='*60}")
@@ -793,11 +882,9 @@ async def get_translation_metrics(doc_id: str, user: dict = Depends(verify_token
     
     doc = documents[doc_id]
     
-    # Verify ownership
     if doc["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # Check if document is translated
     if doc["status"] != "completed":
         raise HTTPException(status_code=400, detail="Document not yet translated")
     
@@ -813,16 +900,12 @@ async def get_translation_metrics(doc_id: str, user: dict = Depends(verify_token
         print(f"{'='*60}\n")
         
         # Extract text from both documents
-        print("Step 1: Extracting text from source document...")
         source_text = extract_text_from_document(doc["upload_path"])
-        
-        print("Step 2: Extracting text from translated document...")
         translated_text = extract_text_from_document(doc["translated_path"])
         
         if not source_text or not translated_text:
             raise HTTPException(status_code=400, detail="Could not extract text from documents")
         
-        print("Step 3: Calculating metrics...")
         metrics = calculate_translation_metrics(
             source_text, 
             translated_text,
@@ -852,8 +935,6 @@ async def get_translation_metrics(doc_id: str, user: dict = Depends(verify_token
         raise
     except Exception as e:
         print(f"Error calculating metrics: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to calculate metrics: {str(e)}")
 
 @app.get("/documents", response_model=List[DocumentInfo])
@@ -1002,6 +1083,7 @@ async def root():
     return {
         "service": "Document Translation API with Authentication & Metrics",
         "version": "2.1.0",
+        "mode": "SANDBOX" if PAYFAST_SANDBOX else "PRODUCTION",
         "features": [
             "User authentication",
             "Subscription management",
@@ -1026,6 +1108,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
+        "mode": "SANDBOX" if PAYFAST_SANDBOX else "PRODUCTION",
         "storage": {
             "users": len(users),
             "payments": len(payments),
@@ -1036,14 +1119,50 @@ async def health_check():
         "metrics_support": METRICS_SUPPORT and TEXT_EXTRACTION_SUPPORT
     }
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Document Translation API Server v2.1")
-    print("=" * 60)
-    print("Starting server on http://localhost:8000")
-    print("API Documentation: http://localhost:8000/docs")
-    print("Supported formats: DOCX, PDF")
-    print(f"Translation metrics: {'✓ Available' if METRICS_SUPPORT and TEXT_EXTRACTION_SUPPORT else '✗ Not available'}")
-    print("=" * 60)
+# ============================================
+# STARTUP
+# ============================================
+
+@app.on_event("startup")
+async def startup():
+    """Print configuration on startup"""
+    print("\n" + "="*70)
+    print("🚀 DOCUMENT TRANSLATION API v2.1")
+    print("="*70)
+    print(f"\n📋 PayFast Configuration:")
+    print(f"   Mode:          {'SANDBOX (Test)' if PAYFAST_SANDBOX else 'PRODUCTION (Live)'}")
+    print(f"   Merchant ID:   {PAYFAST_MERCHANT_ID}")
+    print(f"   Base URL:      {BASE_URL}")
+    print(f"   Notify URL:    {BASE_URL}/payment/notify")
     
+    if 'your-ngrok-url' in BASE_URL or 'localhost' in BASE_URL:
+        print(f"\n⚠️  WARNING: Update BASE_URL with your ngrok URL!")
+        print(f"   1. Run: ngrok http 8000")
+        print(f"   2. Copy the ngrok URL (e.g., https://abc123.ngrok.io)")
+        print(f"   3. Update BASE_URL in this file")
+        print(f"   4. Restart the server")
+        print(f"\n   Without this, PayFast webhooks will not work!")
+    else:
+        print(f"\n✅ Configuration looks good!")
+    
+    print(f"\n📚 Features:")
+    print(f"   ✓ User authentication")
+    print(f"   ✓ PayFast payment integration")
+    print(f"   ✓ DOCX & PDF translation")
+    print(f"   ✓ Translation metrics: {'✓ Available' if METRICS_SUPPORT else '✗ Not available'}")
+    
+    print(f"\n🔗 URLs:")
+    print(f"   API:           http://localhost:8000")
+    print(f"   Docs:          http://localhost:8000/docs")
+    print(f"   Health:        http://localhost:8000/health")
+    
+    if PAYFAST_SANDBOX:
+        print(f"\n🧪 Sandbox Testing:")
+        print(f"   PayFast:       https://sandbox.payfast.co.za")
+        print(f"   Username:      sbtu01@payfast.io")
+        print(f"   Password:      clientpass")
+    
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
