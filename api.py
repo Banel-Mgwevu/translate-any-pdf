@@ -16,8 +16,8 @@ IMPORTANT SETUP:
 4. Set passphrase in PayFast sandbox: https://sandbox.payfast.co.za
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends, Query
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -74,6 +74,14 @@ app = FastAPI(
 )
 
 # ============================================
+# ENVIRONMENT CONFIGURATION
+# ============================================
+
+# Backend and Frontend URLs
+BACKEND_URL = os.getenv("BACKEND_URL", "https://translate-any-pdf.onrender.com")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://translation-app-frontend-lhk5.onrender.com")
+
+# ============================================
 # PAYFAST CONFIGURATION - UPDATE THESE!
 # ============================================
 
@@ -89,11 +97,6 @@ SANDBOX_PASSPHRASE = "jt7NOE43FZPn"  # Set this in your sandbox dashboard
 PRODUCTION_MERCHANT_ID = "your-production-merchant-id"  # Replace with real ID
 PRODUCTION_MERCHANT_KEY = "your-production-merchant-key"  # Replace with real key
 PRODUCTION_PASSPHRASE = "your-production-passphrase"  # Replace with real passphrase
-
-# ⚠️ CRITICAL: Update this with your ngrok URL or deployed server URL
-# For local testing: Run "ngrok http 8000" and copy the URL here
-# For production: Use your actual domain
-BASE_URL = "https://translate-any-pdf.onrender.com"  # 🚨 CHANGE THIS!
 
 # Get current credentials based on mode
 PAYFAST_MERCHANT_ID = SANDBOX_MERCHANT_ID if PAYFAST_SANDBOX else PRODUCTION_MERCHANT_ID
@@ -522,7 +525,7 @@ async def get_current_user(user: dict = Depends(verify_token)):
     )
 
 # ============================================
-# PAYMENT ENDPOINTS (FIXED)
+# PAYMENT ENDPOINTS
 # ============================================
 
 @app.post("/payment/initiate")
@@ -552,18 +555,19 @@ async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(ve
     payments[payment_id] = payment_record
     save_json(PAYMENTS_FILE, payments)
     
-    # Build payment data in correct order
+    # Build payment data in correct order (with tier in URLs)
     payment_data = {
         'merchant_id': PAYFAST_MERCHANT_ID,
         'merchant_key': PAYFAST_MERCHANT_KEY,
-        'return_url': f'{BASE_URL}/payment/success',
-        'cancel_url': f'{BASE_URL}/payment/cancel',
-        'notify_url': f'{BASE_URL}/payment/notify',
+        'return_url': f'{BACKEND_URL}/payment/success?tier={request.tier}',
+        'cancel_url': f'{BACKEND_URL}/payment/cancel',
+        'notify_url': f'{BACKEND_URL}/payment/notify',
         'amount': f"{tier_info['price']:.2f}",
         'item_name': f"{tier_info['name']} Subscription",
         'item_description': f"Monthly subscription to {tier_info['name']} plan",
         'custom_str1': payment_id,
-        'custom_str2': user["user_id"]
+        'custom_str2': user["user_id"],
+        'custom_str3': request.tier
     }
     
     # Generate signature with passphrase
@@ -581,18 +585,12 @@ async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(ve
     print(f"Amount:        R{tier_info['price']:.2f}")
     print(f"Plan:          {tier_info['name']}")
     print(f"User:          {user['email']}")
+    print(f"Return URL:    {payment_data['return_url']}")
+    print(f"Cancel URL:    {payment_data['cancel_url']}")
     print(f"Notify URL:    {payment_data['notify_url']}")
     print(f"Signature:     {signature}")
     print(f"PayFast URL:   {payfast_url}")
     print(f"{'='*70}\n")
-    
-    # Check if notify_url is accessible
-    if 'localhost' in BASE_URL or '127.0.0.1' in BASE_URL or 'your-ngrok-url' in BASE_URL:
-        print("⚠️  WARNING: notify_url uses localhost or placeholder - webhooks will fail!")
-        print("   1. Run: ngrok http 8000")
-        print("   2. Copy ngrok URL")
-        print("   3. Update BASE_URL in this file")
-        print("   4. Restart the server\n")
     
     return {
         "payment_id": payment_id,
@@ -600,6 +598,81 @@ async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(ve
         "payment_data": payment_data,
         "message": "Redirect user to payment_url with payment_data"
     }
+
+@app.get("/payment/success")
+async def payment_success(
+    request: Request,
+    tier: str = Query(None),
+    m_payment_id: str = Query(None),
+    pf_payment_id: str = Query(None),
+    custom_str1: str = Query(None),  # payment_id
+    custom_str2: str = Query(None),  # user_id
+    custom_str3: str = Query(None)   # tier (backup)
+):
+    """
+    Handle PayFast return_url redirect after successful payment.
+    Redirects user back to frontend with success parameters.
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"✅ PAYMENT SUCCESS PAGE ACCESSED")
+    print(f"{'='*70}")
+    print(f"Tier (from URL):          {tier}")
+    print(f"Payment ID (custom_str1): {custom_str1}")
+    print(f"User ID (custom_str2):    {custom_str2}")
+    print(f"Tier (custom_str3):       {custom_str3}")
+    print(f"PayFast ID:               {pf_payment_id}")
+    print(f"{'='*70}\n")
+    
+    # Get tier from multiple sources (priority order)
+    final_tier = tier or custom_str3 or "professional"
+    
+    # Get payment details to verify tier
+    if custom_str1 and custom_str1 in payments:
+        payment = payments[custom_str1]
+        final_tier = payment.get("tier", final_tier)
+        print(f"Found payment record: {final_tier} tier")
+    
+    # Redirect to frontend with success parameters
+    redirect_url = f"{FRONTEND_URL}/?payment_status=success&tier={final_tier}"
+    
+    print(f"Redirecting to: {redirect_url}\n")
+    
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@app.get("/payment/cancel")
+async def payment_cancel(
+    request: Request,
+    custom_str1: str = Query(None),  # payment_id
+    custom_str2: str = Query(None)   # user_id
+):
+    """
+    Handle PayFast cancel_url redirect when user cancels payment.
+    Redirects user back to frontend with cancel status.
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"❌ PAYMENT CANCELLED")
+    print(f"{'='*70}")
+    print(f"Payment ID (custom_str1): {custom_str1}")
+    print(f"User ID (custom_str2):    {custom_str2}")
+    print(f"{'='*70}\n")
+    
+    # Update payment status if we have the payment_id
+    if custom_str1 and custom_str1 in payments:
+        payments[custom_str1]["status"] = "cancelled"
+        payments[custom_str1]["updated_at"] = datetime.now().isoformat()
+        save_json(PAYMENTS_FILE, payments)
+        print(f"Payment {custom_str1} marked as cancelled")
+    
+    # Redirect to frontend with cancel status
+    redirect_url = f"{FRONTEND_URL}/?payment_status=cancelled"
+    
+    print(f"Redirecting to: {redirect_url}\n")
+    
+    return RedirectResponse(url=redirect_url, status_code=302)
+
 
 @app.post("/payment/notify")
 async def payment_notify(request: Request):
@@ -644,12 +717,14 @@ async def payment_notify(request: Request):
     # Get payment details
     payment_id = data.get("custom_str1")
     user_id = data.get("custom_str2")
+    tier = data.get("custom_str3")
     payment_status = data.get("payment_status")
     amount_gross = data.get("amount_gross")
     
     print(f"📋 PAYMENT DETAILS:")
     print(f"   Payment ID:  {payment_id}")
     print(f"   User ID:     {user_id}")
+    print(f"   Tier:        {tier}")
     print(f"   Status:      {payment_status}")
     print(f"   Amount:      R{amount_gross}\n")
     
@@ -1129,29 +1204,34 @@ async def startup():
     print("\n" + "="*70)
     print("🚀 DOCUMENT TRANSLATION API v2.1")
     print("="*70)
-    print(f"\n📋 PayFast Configuration:")
+    print(f"\n📋 Configuration:")
     print(f"   Mode:          {'SANDBOX (Test)' if PAYFAST_SANDBOX else 'PRODUCTION (Live)'}")
+    print(f"   Backend URL:   {BACKEND_URL}")
+    print(f"   Frontend URL:  {FRONTEND_URL}")
     print(f"   Merchant ID:   {PAYFAST_MERCHANT_ID}")
-    print(f"   Base URL:      {BASE_URL}")
-    print(f"   Notify URL:    {BASE_URL}/payment/notify")
     
-    if 'your-ngrok-url' in BASE_URL or 'localhost' in BASE_URL:
-        print(f"\n⚠️  WARNING: Update BASE_URL with your ngrok URL!")
+    print(f"\n🔗 Payment URLs:")
+    print(f"   Return URL:    {BACKEND_URL}/payment/success")
+    print(f"   Cancel URL:    {BACKEND_URL}/payment/cancel")
+    print(f"   Notify URL:    {BACKEND_URL}/payment/notify")
+    
+    if 'localhost' in BACKEND_URL or '127.0.0.1' in BACKEND_URL:
+        print(f"\n⚠️  WARNING: Backend URL uses localhost - webhooks will fail!")
+        print(f"   For local testing with PayFast webhooks:")
         print(f"   1. Run: ngrok http 8000")
-        print(f"   2. Copy the ngrok URL (e.g., https://abc123.ngrok.io)")
-        print(f"   3. Update BASE_URL in this file")
-        print(f"   4. Restart the server")
-        print(f"\n   Without this, PayFast webhooks will not work!")
+        print(f"   2. Update BACKEND_URL with ngrok URL")
+        print(f"   3. Restart the server")
     else:
-        print(f"\n✅ Configuration looks good!")
+        print(f"\n✅ URLs configured for production!")
     
     print(f"\n📚 Features:")
     print(f"   ✓ User authentication")
     print(f"   ✓ PayFast payment integration")
+    print(f"   ✓ Payment success/cancel redirects")
     print(f"   ✓ DOCX & PDF translation")
     print(f"   ✓ Translation metrics: {'✓ Available' if METRICS_SUPPORT else '✗ Not available'}")
     
-    print(f"\n🔗 URLs:")
+    print(f"\n🔗 API URLs:")
     print(f"   API:           http://localhost:8000")
     print(f"   Docs:          http://localhost:8000/docs")
     print(f"   Health:        http://localhost:8000/health")
