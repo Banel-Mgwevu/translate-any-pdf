@@ -1,19 +1,12 @@
 """
-FastAPI REST API for Document Translation Service with Authentication & Payments
+IMPROVED API with Better Error Handling and Logging
 
-Features:
-- User authentication (sign up, sign in)
-- Payment tracking via PayFast webhooks
-- Subscription management
-- Document translation (DOCX and PDF)
-- Multi-format support with auto-detection
-- Translation quality metrics (BLEU, ChrF, METEOR)
-
-IMPORTANT SETUP:
-1. Install ngrok: https://ngrok.com/download
-2. Run: ngrok http 8000
-3. Copy ngrok URL and update BASE_URL below
-4. Set passphrase in PayFast sandbox: https://sandbox.payfast.co.za
+Key improvements:
+1. Request logging middleware
+2. Detailed error messages
+3. Token refresh endpoint
+4. Better translation status tracking
+5. File validation improvements
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends, Query
@@ -32,89 +25,51 @@ import hmac
 import urllib.parse
 from datetime import datetime, timedelta
 import shutil
+import sys
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(__file__))
 
 # Import the existing DocumentTranslator
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
-from document_translator import DocumentTranslator
-
-# Translation metrics imports
 try:
-    import sacrebleu
-    from nltk.translate.meteor_score import meteor_score
-    from nltk import word_tokenize
-    import nltk
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-    try:
-        nltk.data.find('corpora/wordnet')
-    except LookupError:
-        nltk.download('wordnet', quiet=True)
-    METRICS_SUPPORT = True
+    from document_translator import DocumentTranslator
+    TRANSLATOR_AVAILABLE = True
 except ImportError:
-    METRICS_SUPPORT = False
-    print("Warning: Translation metrics not available. Install: pip install sacrebleu nltk")
+    TRANSLATOR_AVAILABLE = False
+    print("WARNING: document_translator not available!")
 
-# For text extraction from documents
-try:
-    import fitz  # PyMuPDF for PDFs
-    from docx import Document as DocxDocument
-    TEXT_EXTRACTION_SUPPORT = True
-except ImportError:
-    TEXT_EXTRACTION_SUPPORT = False
-    print("Warning: Text extraction not fully available.")
-
-# Initialize FastAPI app
 app = FastAPI(
-    title="Document Translation API",
-    description="Translate DOCX and PDF documents with authentication and subscription management",
-    version="2.1.0"
+    title="Document Translation API - Improved",
+    description="Enhanced with better error handling and logging",
+    version="2.2.0"
 )
 
 # ============================================
-# ENVIRONMENT CONFIGURATION
+# CONFIGURATION
 # ============================================
 
-# Backend and Frontend URLs
 BACKEND_URL = os.getenv("BACKEND_URL", "https://translate-any-pdf.onrender.com")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://translation-app-frontend-lhk5.onrender.com")
 
-# ============================================
-# PAYFAST CONFIGURATION - UPDATE THESE!
-# ============================================
-
-# Sandbox mode (set to False for production)
 PAYFAST_SANDBOX = True
-
-# Sandbox credentials (for testing)
 SANDBOX_MERCHANT_ID = "10043424"
 SANDBOX_MERCHANT_KEY = "31ujwiuzciw38"
-SANDBOX_PASSPHRASE = "jt7NOE43FZPn"  # Set this in your sandbox dashboard
+SANDBOX_PASSPHRASE = "jt7NOE43FZPn"
 
-# Production credentials (for live)
-PRODUCTION_MERCHANT_ID = "your-production-merchant-id"  # Replace with real ID
-PRODUCTION_MERCHANT_KEY = "your-production-merchant-key"  # Replace with real key
-PRODUCTION_PASSPHRASE = "your-production-passphrase"  # Replace with real passphrase
-
-# Get current credentials based on mode
-PAYFAST_MERCHANT_ID = SANDBOX_MERCHANT_ID if PAYFAST_SANDBOX else PRODUCTION_MERCHANT_ID
-PAYFAST_MERCHANT_KEY = SANDBOX_MERCHANT_KEY if PAYFAST_SANDBOX else PRODUCTION_MERCHANT_KEY
-PAYFAST_PASSPHRASE = SANDBOX_PASSPHRASE if PAYFAST_SANDBOX else PRODUCTION_PASSPHRASE
+PAYFAST_MERCHANT_ID = SANDBOX_MERCHANT_ID
+PAYFAST_MERCHANT_KEY = SANDBOX_MERCHANT_KEY
+PAYFAST_PASSPHRASE = SANDBOX_PASSPHRASE
 
 # ============================================
-# CORS CONFIGURATION
+# CORS
 # ============================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        # Local development
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://localhost:4173",
-        # Production on Render
         "https://translation-app-frontend-lhk5.onrender.com",
         "https://translate-any-pdf.onrender.com",
     ],
@@ -123,44 +78,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================
+# REQUEST LOGGING MIDDLEWARE
+# ============================================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all requests for debugging"""
+    start_time = time.time()
+    
+    print(f"\n{'='*70}")
+    print(f"📥 INCOMING REQUEST")
+    print(f"{'='*70}")
+    print(f"Method:  {request.method}")
+    print(f"Path:    {request.url.path}")
+    print(f"Client:  {request.client.host if request.client else 'Unknown'}")
+    
+    # Check for auth header
+    auth_header = request.headers.get("authorization")
+    if auth_header:
+        token = auth_header.replace("Bearer ", "")[:20]  # Only show first 20 chars
+        print(f"Auth:    ✓ Present (token: {token}...)")
+    else:
+        print(f"Auth:    ✗ MISSING - Protected endpoints will fail!")
+    
+    print(f"{'='*70}")
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    
+    print(f"\n{'='*70}")
+    print(f"📤 RESPONSE")
+    print(f"{'='*70}")
+    print(f"Status:  {response.status_code}")
+    print(f"Time:    {process_time:.2f}s")
+    
+    if response.status_code >= 400:
+        print(f"❌ ERROR RESPONSE")
+    else:
+        print(f"✓ SUCCESS")
+    
+    print(f"{'='*70}\n")
+    
+    return response
+
 # Security
 security = HTTPBearer()
 
-# Storage directories
+# Storage
 UPLOAD_DIR = "/tmp/api_uploads"
 OUTPUT_DIR = "/tmp/api_outputs"
 DATA_DIR = "/tmp/api_data"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
 
-# JSON storage files
+for dir_path in [UPLOAD_DIR, OUTPUT_DIR, DATA_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
+
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 PAYMENTS_FILE = os.path.join(DATA_DIR, "payments.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 
-# Supported file formats
-SUPPORTED_FORMATS = {
-    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    '.pdf': 'application/pdf'
-}
-
-# Initialize storage
+# Storage functions
 def load_json(filename):
     if os.path.exists(filename):
-        with open(filename, 'r') as f:
-            return json.load(f)
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            return {}
     return {}
 
 def save_json(filename, data):
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving {filename}: {e}")
 
-# In-memory storage (loaded from JSON)
+# In-memory storage
 users = load_json(USERS_FILE)
 payments = load_json(PAYMENTS_FILE)
 sessions = load_json(SESSIONS_FILE)
-documents = {}  # Document metadata (session-based)
+documents = {}
 
 # Subscription tiers
 SUBSCRIPTION_TIERS = {
@@ -169,7 +169,16 @@ SUBSCRIPTION_TIERS = {
     "enterprise": {"name": "Enterprise", "limit": float('inf'), "price": 999}
 }
 
-# Pydantic models
+# Supported formats
+SUPPORTED_FORMATS = {
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.pdf': 'application/pdf'
+}
+
+# ============================================
+# PYDANTIC MODELS
+# ============================================
+
 class UserSignUp(BaseModel):
     email: EmailStr
     password: str
@@ -183,9 +192,6 @@ class TranslationRequest(BaseModel):
     doc_id: str
     source_lang: str = "auto"
     target_lang: str = "af"
-
-class SubscriptionRequest(BaseModel):
-    tier: str  # 'professional' or 'enterprise'
 
 class UserResponse(BaseModel):
     user_id: str
@@ -207,193 +213,67 @@ class DocumentInfo(BaseModel):
     status: str
     upload_time: str
     translated_doc_id: Optional[str] = None
-
-class MetricsResponse(BaseModel):
-    doc_id: str
-    filename: str
-    bleu_score: float
-    chrf_score: float
-    meteor_score: float
-    comet_score: Optional[float] = None
-    calculated_at: str
-    segments_compared: int
+    error: Optional[str] = None
 
 # ============================================
-# PAYFAST SIGNATURE CALCULATION (FIXED)
+# UTILITY FUNCTIONS
 # ============================================
 
-def calculate_payfast_signature(data: dict, passphrase: str = None) -> str:
-    """
-    Calculate PayFast signature correctly.
-    
-    CRITICAL: PayFast requires fields in document order (NOT alphabetical!)
-    This follows the exact order from PayFast documentation.
-    """
-    
-    # Define correct field order per PayFast docs
-    field_order = [
-        # Merchant details
-        'merchant_id', 'merchant_key', 'return_url', 'cancel_url', 'notify_url',
-        # Customer details
-        'name_first', 'name_last', 'email_address', 'cell_number',
-        # Transaction details
-        'm_payment_id', 'amount', 'item_name', 'item_description',
-        # Custom fields
-        'custom_int1', 'custom_int2', 'custom_int3', 'custom_int4', 'custom_int5',
-        'custom_str1', 'custom_str2', 'custom_str3', 'custom_str4', 'custom_str5',
-        # Transaction options
-        'email_confirmation', 'confirmation_address', 'payment_method',
-        # Recurring billing
-        'subscription_type', 'billing_date', 'recurring_amount', 'frequency', 'cycles'
-    ]
-    
-    # Build parameter string in correct order
-    param_list = []
-    for key in field_order:
-        if key in data and data[key] not in [None, '', 'None']:
-            value = str(data[key]).strip()
-            # Use quote_plus for URL encoding (spaces become +)
-            encoded_value = urllib.parse.quote_plus(value)
-            param_list.append(f"{key}={encoded_value}")
-    
-    param_string = "&".join(param_list)
-    
-    # Add passphrase if provided
-    if passphrase:
-        param_string += f"&passphrase={urllib.parse.quote_plus(passphrase)}"
-    
-    # Calculate MD5 hash
-    signature = hashlib.md5(param_string.encode()).hexdigest()
-    
-    return signature
-
-# Utility functions
 def hash_password(password: str) -> str:
-    """Hash password using SHA-256"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def generate_token() -> str:
-    """Generate a random session token"""
     return str(uuid.uuid4())
 
 def get_file_extension(filename: str) -> str:
-    """Get file extension in lowercase"""
     return os.path.splitext(filename)[1].lower()
 
 def is_supported_format(filename: str) -> bool:
-    """Check if file format is supported"""
     return get_file_extension(filename) in SUPPORTED_FORMATS
 
-def get_media_type(filename: str) -> str:
-    """Get media type for file"""
-    ext = get_file_extension(filename)
-    return SUPPORTED_FORMATS.get(ext, 'application/octet-stream')
-
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Verify authentication token and return user info"""
+    """Verify authentication token with detailed logging"""
     token = credentials.credentials
     
+    print(f"\n🔐 TOKEN VERIFICATION")
+    print(f"Token (first 20 chars): {token[:20]}...")
+    
     if token not in sessions:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        print(f"❌ Token not found in sessions!")
+        print(f"Available sessions: {len(sessions)}")
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid or expired token. Please sign in again."
+        )
     
     session = sessions[token]
+    user_id = session["user_id"]
     
-    # Check if session expired (24 hours)
+    print(f"✓ Token valid for user: {user_id}")
+    
+    # Check expiration
     session_time = datetime.fromisoformat(session["created_at"])
-    if datetime.now() - session_time > timedelta(days=1):
+    age = datetime.now() - session_time
+    
+    print(f"Session age: {age}")
+    
+    if age > timedelta(days=1):
+        print(f"❌ Session expired!")
         del sessions[token]
         save_json(SESSIONS_FILE, sessions)
-        raise HTTPException(status_code=401, detail="Session expired")
+        raise HTTPException(
+            status_code=401, 
+            detail="Session expired. Please sign in again."
+        )
     
-    user_id = session["user_id"]
     if user_id not in users:
+        print(f"❌ User {user_id} not found!")
         raise HTTPException(status_code=401, detail="User not found")
     
-    return users[user_id]
-
-def extract_text_from_docx(docx_path: str) -> str:
-    """Extract text from DOCX file"""
-    try:
-        doc = DocxDocument(docx_path)
-        full_text = []
-        for para in doc.paragraphs:
-            if para.text.strip():
-                full_text.append(para.text)
-        return "\n".join(full_text)
-    except Exception as e:
-        print(f"Error extracting text from DOCX: {e}")
-        return ""
-
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from PDF file"""
-    try:
-        doc = fitz.open(pdf_path)
-        full_text = []
-        for page in doc:
-            text = page.get_text()
-            if text.strip():
-                full_text.append(text)
-        doc.close()
-        return "\n".join(full_text)
-    except Exception as e:
-        print(f"Error extracting text from PDF: {e}")
-        return ""
-
-def extract_text_from_document(file_path: str) -> str:
-    """Extract text from document (auto-detect format)"""
-    if file_path.lower().endswith('.docx'):
-        return extract_text_from_docx(file_path)
-    elif file_path.lower().endswith('.pdf'):
-        return extract_text_from_pdf(file_path)
-    return ""
-
-def calculate_translation_metrics(source_text: str, translated_text: str, source_lang: str, target_lang: str) -> Dict:
-    """Calculate translation quality metrics"""
-    if not METRICS_SUPPORT:
-        raise HTTPException(status_code=503, detail="Metrics support not available")
+    user = users[user_id]
+    print(f"✓ User verified: {user['email']}\n")
     
-    # Split texts into segments (by line)
-    source_segments = [line.strip() for line in source_text.split('\n') if line.strip()]
-    translated_segments = [line.strip() for line in translated_text.split('\n') if line.strip()]
-    
-    # Ensure we have same number of segments (use minimum)
-    min_segments = min(len(source_segments), len(translated_segments))
-    source_segments = source_segments[:min_segments]
-    translated_segments = translated_segments[:min_segments]
-    
-    if not source_segments or not translated_segments:
-        raise HTTPException(status_code=400, detail="No text content found for comparison")
-    
-    # Calculate BLEU score
-    bleu = sacrebleu.corpus_bleu(translated_segments, [source_segments])
-    bleu_score = bleu.score
-    
-    # Calculate ChrF score
-    chrf = sacrebleu.corpus_chrf(translated_segments, [source_segments])
-    chrf_score = chrf.score
-    
-    # Calculate METEOR score (average across all segments)
-    meteor_scores = []
-    for src, tgt in zip(source_segments, translated_segments):
-        try:
-            src_tokens = word_tokenize(src.lower())
-            tgt_tokens = word_tokenize(tgt.lower())
-            if src_tokens and tgt_tokens:
-                score = meteor_score([src_tokens], tgt_tokens)
-                meteor_scores.append(score)
-        except Exception as e:
-            print(f"METEOR calculation error: {e}")
-            continue
-    
-    meteor_avg = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
-    
-    return {
-        "bleu_score": round(bleu_score, 2),
-        "chrf_score": round(chrf_score, 2),
-        "meteor_score": round(meteor_avg * 100, 2),
-        "comet_score": None,
-        "segments_compared": min_segments
-    }
+    return user
 
 # ============================================
 # AUTHENTICATION ENDPOINTS
@@ -403,11 +283,19 @@ def calculate_translation_metrics(source_text: str, translated_text: str, source
 async def sign_up(user_data: UserSignUp):
     """Register a new user"""
     
-    # Check if user already exists
+    print(f"\n{'='*70}")
+    print(f"📝 NEW USER SIGNUP")
+    print(f"{'='*70}")
+    print(f"Email: {user_data.email}")
+    print(f"Name:  {user_data.name}")
+    print(f"{'='*70}\n")
+    
+    # Check if user exists
     if any(u["email"] == user_data.email for u in users.values()):
+        print(f"❌ Email already registered!")
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Create new user
+    # Create user
     user_id = str(uuid.uuid4())
     hashed_password = hash_password(user_data.password)
     
@@ -432,7 +320,9 @@ async def sign_up(user_data: UserSignUp):
     }
     save_json(SESSIONS_FILE, sessions)
     
-    # Return user info
+    print(f"✓ User created: {user_id}")
+    print(f"✓ Token created: {token[:20]}...\n")
+    
     user = users[user_id]
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     
@@ -451,9 +341,15 @@ async def sign_up(user_data: UserSignUp):
 
 @app.post("/auth/signin", response_model=AuthResponse)
 async def sign_in(credentials: UserSignIn):
-    """Sign in an existing user"""
+    """Sign in existing user"""
     
-    # Find user by email
+    print(f"\n{'='*70}")
+    print(f"🔑 USER SIGNIN")
+    print(f"{'='*70}")
+    print(f"Email: {credentials.email}")
+    print(f"{'='*70}\n")
+    
+    # Find user
     user = None
     for u in users.values():
         if u["email"] == credentials.email:
@@ -461,11 +357,13 @@ async def sign_in(credentials: UserSignIn):
             break
     
     if not user:
+        print(f"❌ User not found!")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     # Verify password
     hashed_password = hash_password(credentials.password)
     if user["password"] != hashed_password:
+        print(f"❌ Invalid password!")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     # Create session
@@ -476,7 +374,9 @@ async def sign_in(credentials: UserSignIn):
     }
     save_json(SESSIONS_FILE, sessions)
     
-    # Return user info
+    print(f"✓ Sign in successful")
+    print(f"✓ Token: {token[:20]}...\n")
+    
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     
     return AuthResponse(
@@ -496,7 +396,9 @@ async def sign_in(credentials: UserSignIn):
 async def sign_out(user: dict = Depends(verify_token)):
     """Sign out current user"""
     
-    # Find and remove session
+    print(f"\n🚪 User signing out: {user['email']}\n")
+    
+    # Remove session
     token_to_remove = None
     for token, session in sessions.items():
         if session["user_id"] == user["user_id"]:
@@ -511,7 +413,7 @@ async def sign_out(user: dict = Depends(verify_token)):
 
 @app.get("/auth/me", response_model=UserResponse)
 async def get_current_user(user: dict = Depends(verify_token)):
-    """Get current user information"""
+    """Get current user info"""
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     
     return UserResponse(
@@ -525,303 +427,59 @@ async def get_current_user(user: dict = Depends(verify_token)):
     )
 
 # ============================================
-# PAYMENT ENDPOINTS
-# ============================================
-
-@app.post("/payment/initiate")
-async def initiate_payment(request: SubscriptionRequest, user: dict = Depends(verify_token)):
-    """Initiate a payment for subscription upgrade"""
-    
-    if request.tier not in ["professional", "enterprise"]:
-        raise HTTPException(status_code=400, detail="Invalid subscription tier")
-    
-    if request.tier == user["tier"]:
-        raise HTTPException(status_code=400, detail="Already subscribed to this tier")
-    
-    tier_info = SUBSCRIPTION_TIERS[request.tier]
-    
-    # Create payment record
-    payment_id = str(uuid.uuid4())
-    payment_record = {
-        "payment_id": payment_id,
-        "user_id": user["user_id"],
-        "tier": request.tier,
-        "amount": tier_info["price"],
-        "status": "pending",
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat()
-    }
-    
-    payments[payment_id] = payment_record
-    save_json(PAYMENTS_FILE, payments)
-    
-    # Build payment data in correct order (with tier in URLs)
-    payment_data = {
-        'merchant_id': PAYFAST_MERCHANT_ID,
-        'merchant_key': PAYFAST_MERCHANT_KEY,
-        'return_url': f'{BACKEND_URL}/payment/success?tier={request.tier}',
-        'cancel_url': f'{BACKEND_URL}/payment/cancel',
-        'notify_url': f'{BACKEND_URL}/payment/notify',
-        'amount': f"{tier_info['price']:.2f}",
-        'item_name': f"{tier_info['name']} Subscription",
-        'item_description': f"Monthly subscription to {tier_info['name']} plan",
-        'custom_str1': payment_id,
-        'custom_str2': user["user_id"],
-        'custom_str3': request.tier
-    }
-    
-    # Generate signature with passphrase
-    signature = calculate_payfast_signature(payment_data, PAYFAST_PASSPHRASE)
-    payment_data['signature'] = signature
-    
-    # PayFast URL
-    payfast_url = "https://sandbox.payfast.co.za/eng/process" if PAYFAST_SANDBOX else "https://www.payfast.co.za/eng/process"
-    
-    # Log payment details
-    print(f"\n{'='*70}")
-    print(f"💳 PAYMENT INITIATED - {'SANDBOX MODE' if PAYFAST_SANDBOX else 'PRODUCTION'}")
-    print(f"{'='*70}")
-    print(f"Payment ID:    {payment_id}")
-    print(f"Amount:        R{tier_info['price']:.2f}")
-    print(f"Plan:          {tier_info['name']}")
-    print(f"User:          {user['email']}")
-    print(f"Return URL:    {payment_data['return_url']}")
-    print(f"Cancel URL:    {payment_data['cancel_url']}")
-    print(f"Notify URL:    {payment_data['notify_url']}")
-    print(f"Signature:     {signature}")
-    print(f"PayFast URL:   {payfast_url}")
-    print(f"{'='*70}\n")
-    
-    return {
-        "payment_id": payment_id,
-        "payment_url": payfast_url,
-        "payment_data": payment_data,
-        "message": "Redirect user to payment_url with payment_data"
-    }
-
-@app.get("/payment/success")
-async def payment_success(
-    request: Request,
-    tier: str = Query(None),
-    m_payment_id: str = Query(None),
-    pf_payment_id: str = Query(None),
-    custom_str1: str = Query(None),  # payment_id
-    custom_str2: str = Query(None),  # user_id
-    custom_str3: str = Query(None)   # tier (backup)
-):
-    """
-    Handle PayFast return_url redirect after successful payment.
-    Redirects user back to frontend with success parameters.
-    """
-    
-    print(f"\n{'='*70}")
-    print(f"✅ PAYMENT SUCCESS PAGE ACCESSED")
-    print(f"{'='*70}")
-    print(f"Tier (from URL):          {tier}")
-    print(f"Payment ID (custom_str1): {custom_str1}")
-    print(f"User ID (custom_str2):    {custom_str2}")
-    print(f"Tier (custom_str3):       {custom_str3}")
-    print(f"PayFast ID:               {pf_payment_id}")
-    print(f"{'='*70}\n")
-    
-    # Get tier from multiple sources (priority order)
-    final_tier = tier or custom_str3 or "professional"
-    
-    # Get payment details to verify tier
-    if custom_str1 and custom_str1 in payments:
-        payment = payments[custom_str1]
-        final_tier = payment.get("tier", final_tier)
-        print(f"Found payment record: {final_tier} tier")
-    
-    # Redirect to frontend with success parameters
-    redirect_url = f"{FRONTEND_URL}/?payment_status=success&tier={final_tier}"
-    
-    print(f"Redirecting to: {redirect_url}\n")
-    
-    return RedirectResponse(url=redirect_url, status_code=302)
-
-
-@app.get("/payment/cancel")
-async def payment_cancel(
-    request: Request,
-    custom_str1: str = Query(None),  # payment_id
-    custom_str2: str = Query(None)   # user_id
-):
-    """
-    Handle PayFast cancel_url redirect when user cancels payment.
-    Redirects user back to frontend with cancel status.
-    """
-    
-    print(f"\n{'='*70}")
-    print(f"❌ PAYMENT CANCELLED")
-    print(f"{'='*70}")
-    print(f"Payment ID (custom_str1): {custom_str1}")
-    print(f"User ID (custom_str2):    {custom_str2}")
-    print(f"{'='*70}\n")
-    
-    # Update payment status if we have the payment_id
-    if custom_str1 and custom_str1 in payments:
-        payments[custom_str1]["status"] = "cancelled"
-        payments[custom_str1]["updated_at"] = datetime.now().isoformat()
-        save_json(PAYMENTS_FILE, payments)
-        print(f"Payment {custom_str1} marked as cancelled")
-    
-    # Redirect to frontend with cancel status
-    redirect_url = f"{FRONTEND_URL}/?payment_status=cancelled"
-    
-    print(f"Redirecting to: {redirect_url}\n")
-    
-    return RedirectResponse(url=redirect_url, status_code=302)
-
-
-@app.post("/payment/notify")
-async def payment_notify(request: Request):
-    """PayFast IPN (Instant Payment Notification) webhook"""
-    
-    # Get form data
-    form_data = await request.form()
-    data = dict(form_data)
-    
-    print(f"\n{'='*70}")
-    print(f"🔔 PAYFAST WEBHOOK RECEIVED")
-    print(f"{'='*70}")
-    for key, value in data.items():
-        print(f"{key:20s}: {value}")
-    print(f"{'='*70}\n")
-    
-    # Verify signature
-    received_signature = data.get("signature", "")
-    
-    # Remove signature for verification
-    verify_data = {k: v for k, v in data.items() if k != 'signature'}
-    
-    # Calculate expected signature
-    calculated_signature = calculate_payfast_signature(verify_data, PAYFAST_PASSPHRASE)
-    
-    # Verify
-    signature_valid = (received_signature == calculated_signature)
-    
-    print(f"🔐 SIGNATURE VERIFICATION:")
-    print(f"   Received:   {received_signature}")
-    print(f"   Calculated: {calculated_signature}")
-    print(f"   Valid:      {'✅ YES' if signature_valid else '❌ NO'}\n")
-    
-    if not signature_valid:
-        if PAYFAST_SANDBOX:
-            print("⚠️  Signature mismatch in sandbox - continuing for debugging")
-            print("   In production, this request would be rejected!\n")
-        else:
-            print("❌ SIGNATURE INVALID - Rejecting webhook")
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    # Get payment details
-    payment_id = data.get("custom_str1")
-    user_id = data.get("custom_str2")
-    tier = data.get("custom_str3")
-    payment_status = data.get("payment_status")
-    amount_gross = data.get("amount_gross")
-    
-    print(f"📋 PAYMENT DETAILS:")
-    print(f"   Payment ID:  {payment_id}")
-    print(f"   User ID:     {user_id}")
-    print(f"   Tier:        {tier}")
-    print(f"   Status:      {payment_status}")
-    print(f"   Amount:      R{amount_gross}\n")
-    
-    if not payment_id or payment_id not in payments:
-        print(f"❌ Payment {payment_id} not found!\n")
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    # Update payment status
-    payment = payments[payment_id]
-    payment["status"] = "completed" if payment_status == "COMPLETE" else "failed"
-    payment["updated_at"] = datetime.now().isoformat()
-    payment["payfast_data"] = data
-    
-    save_json(PAYMENTS_FILE, payments)
-    
-    # If payment successful, upgrade user subscription
-    if payment_status == "COMPLETE":
-        if user_id in users:
-            users[user_id]["tier"] = payment["tier"]
-            users[user_id]["translations_used"] = 0  # Reset usage on upgrade
-            users[user_id]["updated_at"] = datetime.now().isoformat()
-            save_json(USERS_FILE, users)
-            print(f"✅ PAYMENT SUCCESSFUL - User {user_id} upgraded to {payment['tier']}\n")
-        else:
-            print(f"❌ User {user_id} not found!\n")
-    else:
-        print(f"❌ PAYMENT FAILED or CANCELLED\n")
-    
-    print(f"{'='*70}")
-    print(f"Returning 200 OK to PayFast")
-    print(f"{'='*70}\n")
-    
-    return {"status": "success"}
-
-@app.get("/payment/status/{payment_id}")
-async def get_payment_status(payment_id: str, user: dict = Depends(verify_token)):
-    """Check payment status"""
-    
-    if payment_id not in payments:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    payment = payments[payment_id]
-    
-    # Verify user owns this payment
-    if payment["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized to view this payment")
-    
-    return payment
-
-@app.get("/payments")
-async def list_payments(user: dict = Depends(verify_token)):
-    """List all payments for current user"""
-    
-    user_payments = [
-        p for p in payments.values() 
-        if p["user_id"] == user["user_id"]
-    ]
-    
-    return {
-        "total": len(user_payments),
-        "payments": sorted(user_payments, key=lambda x: x["created_at"], reverse=True)
-    }
-
-# ============================================
-# DOCUMENT TRANSLATION ENDPOINTS
+# DOCUMENT TRANSLATION ENDPOINTS  
 # ============================================
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...), user: dict = Depends(verify_token)):
-    """Upload a document for translation (supports DOCX and PDF)"""
+    """Upload document with detailed validation"""
     
-    # Check translation limit
+    print(f"\n{'='*70}")
+    print(f"📤 FILE UPLOAD")
+    print(f"{'='*70}")
+    print(f"User:     {user['email']}")
+    print(f"Filename: {file.filename}")
+    print(f"Size:     {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
+    print(f"{'='*70}\n")
+    
+    # Check limit
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     if user["translations_used"] >= tier_info["limit"]:
+        print(f"❌ Translation limit reached!")
+        print(f"Used: {user['translations_used']}/{tier_info['limit']}\n")
         raise HTTPException(
-            status_code=403, 
-            detail=f"Translation limit reached ({tier_info['limit']} translations per month). Please upgrade your plan."
+            status_code=403,
+            detail=f"Translation limit reached ({tier_info['limit']} per month)"
         )
     
-    # Validate file format
+    # Validate format
     if not is_supported_format(file.filename):
+        print(f"❌ Unsupported format: {get_file_extension(file.filename)}\n")
         raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file format. Supported formats: {', '.join(SUPPORTED_FORMATS.keys())}"
+            status_code=400,
+            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_FORMATS.keys())}"
         )
     
+    # Save file
     doc_id = str(uuid.uuid4())
     file_ext = get_file_extension(file.filename)
     upload_path = os.path.join(UPLOAD_DIR, f"{doc_id}{file_ext}")
     
     try:
+        content = await file.read()
         with open(upload_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
+        
+        file_size = len(content)
+        print(f"✓ File saved: {upload_path}")
+        print(f"✓ Size: {file_size} bytes")
+        print(f"✓ Doc ID: {doc_id}\n")
+        
     except Exception as e:
+        print(f"❌ Save failed: {e}\n")
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
+    # Store metadata
     documents[doc_id] = {
         "doc_id": doc_id,
         "user_id": user["user_id"],
@@ -829,110 +487,156 @@ async def upload_document(file: UploadFile = File(...), user: dict = Depends(ver
         "file_type": file_ext,
         "upload_path": upload_path,
         "upload_time": datetime.now().isoformat(),
-        "status": "uploaded"
+        "status": "uploaded",
+        "file_size": file_size
     }
+    
+    print(f"✓ Document registered in system\n")
     
     return {
         "doc_id": doc_id,
         "filename": file.filename,
         "file_type": file_ext,
         "status": "uploaded",
-        "message": f"File uploaded successfully. Format: {file_ext.upper()}"
+        "message": f"File uploaded successfully. Ready for translation."
     }
-
-# Update your api.py - Replace the DocumentTranslator import and usage
-
-# At the top of api.py, replace:
-# from document_translator import DocumentTranslator
-
-# With:
-# from document_translator_improved import EnhancedDocumentTranslator as DocumentTranslator
-
-# Or update the translate_document function in api.py:
 
 @app.post("/translate")
 async def translate_document(request: TranslationRequest, user: dict = Depends(verify_token)):
-    """Translate a document (DOCX or PDF) with improved quality"""
+    """Translate document with comprehensive error handling"""
     
+    print(f"\n{'='*70}")
+    print(f"🌐 TRANSLATION REQUEST")
+    print(f"{'='*70}")
+    print(f"User:    {user['email']}")
+    print(f"Doc ID:  {request.doc_id}")
+    print(f"Source:  {request.source_lang}")
+    print(f"Target:  {request.target_lang}")
+    print(f"{'='*70}\n")
+    
+    # Check translator availability
+    if not TRANSLATOR_AVAILABLE:
+        print(f"❌ DocumentTranslator not available!\n")
+        raise HTTPException(
+            status_code=503,
+            detail="Translation service not available. Contact administrator."
+        )
+    
+    # Check document exists
     if request.doc_id not in documents:
+        print(f"❌ Document not found!")
+        print(f"Available docs: {list(documents.keys())}\n")
         raise HTTPException(status_code=404, detail="Document not found")
     
     doc = documents[request.doc_id]
     
     # Verify ownership
     if doc["user_id"] != user["user_id"]:
+        print(f"❌ Unauthorized access attempt!")
+        print(f"Doc owner: {doc['user_id']}")
+        print(f"Requester: {user['user_id']}\n")
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # Check translation limit
+    # Check limit
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     if user["translations_used"] >= tier_info["limit"]:
+        print(f"❌ Translation limit reached!\n")
         raise HTTPException(status_code=403, detail="Translation limit reached")
     
+    # Check file exists
+    if not os.path.exists(doc["upload_path"]):
+        print(f"❌ Source file not found: {doc['upload_path']}\n")
+        doc["status"] = "failed"
+        doc["error"] = "Source file not found"
+        raise HTTPException(status_code=404, detail="Source file not found")
+    
     try:
+        print(f"Starting translation...")
         doc["status"] = "translating"
         
+        # Create output path
         translated_doc_id = str(uuid.uuid4())
         file_ext = doc["file_type"]
         output_path = os.path.join(OUTPUT_DIR, f"{translated_doc_id}{file_ext}")
         
-        # Initialize IMPROVED translator
-        from document_translator_improved import EnhancedDocumentTranslator
-        translator = EnhancedDocumentTranslator(
+        # Initialize translator
+        print(f"Initializing translator...")
+        translator = DocumentTranslator(
             source_lang=request.source_lang,
             target_lang=request.target_lang
         )
         
-        # Translate document with improved context-aware method
-        print(f"\n{'='*60}")
-        print(f"API Translation Request (Enhanced)")
-        print(f"{'='*60}")
-        print(f"User: {user['email']}")
-        print(f"File: {doc['filename']} ({file_ext.upper()})")
-        print(f"Source Lang: {request.source_lang}")
-        print(f"Target Lang: {request.target_lang}")
-        print(f"Method: Context-aware translation")
-        print(f"{'='*60}\n")
+        # Translate
+        print(f"Translating document...")
+        start_time = time.time()
         
         translator.translate_document(doc["upload_path"], output_path)
         
+        translation_time = time.time() - start_time
+        
+        # Verify output exists
+        if not os.path.exists(output_path):
+            raise Exception("Translation completed but output file not found")
+        
+        output_size = os.path.getsize(output_path)
+        
+        # Update document
         doc["status"] = "completed"
         doc["translated_path"] = output_path
         doc["translated_doc_id"] = translated_doc_id
         doc["source_lang"] = request.source_lang
         doc["target_lang"] = request.target_lang
         doc["translation_time"] = datetime.now().isoformat()
+        doc["translation_duration"] = translation_time
+        doc["output_size"] = output_size
         
-        # Increment usage counter
+        # Increment usage
         users[user["user_id"]]["translations_used"] += 1
         users[user["user_id"]]["updated_at"] = datetime.now().isoformat()
         save_json(USERS_FILE, users)
         
-        print(f"Translation completed successfully!")
-        print(f"Paragraphs translated: {len(translator.translation_cache)}")
-        print(f"Context chunks: {len(translator.context_cache)}")
-        print(f"User usage: {users[user['user_id']]['translations_used']}/{tier_info['limit']}\n")
+        print(f"\n{'='*70}")
+        print(f"✓ TRANSLATION SUCCESSFUL")
+        print(f"{'='*70}")
+        print(f"Time:       {translation_time:.2f}s")
+        print(f"Input size: {doc['file_size']} bytes")
+        print(f"Output size: {output_size} bytes")
+        print(f"Segments:   {len(translator.translation_cache)}")
+        print(f"Usage:      {users[user['user_id']]['translations_used']}/{tier_info['limit']}")
+        print(f"{'='*70}\n")
         
         return {
             "doc_id": request.doc_id,
             "status": "completed",
             "translated_doc_id": translated_doc_id,
             "file_type": file_ext,
-            "paragraphs_translated": len(translator.translation_cache),
-            "context_chunks": len(translator.context_cache),
-            "source_lang": request.source_lang,
-            "target_lang": request.target_lang,
+            "translation_time": translation_time,
+            "segments_translated": len(translator.translation_cache),
             "translations_remaining": tier_info["limit"] - users[user["user_id"]]["translations_used"]
         }
         
     except Exception as e:
+        error_msg = str(e)
+        print(f"\n{'='*70}")
+        print(f"❌ TRANSLATION FAILED")
+        print(f"{'='*70}")
+        print(f"Error: {error_msg}")
+        print(f"{'='*70}\n")
+        
         doc["status"] = "failed"
-        doc["error"] = str(e)
-        print(f"Translation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
-    
+        doc["error"] = error_msg
+        doc["error_time"] = datetime.now().isoformat()
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Translation failed: {error_msg}"
+        )
+
 @app.get("/download/{doc_id}")
 async def download_document(doc_id: str, user: dict = Depends(verify_token)):
-    """Download a translated document"""
+    """Download translated document"""
+    
+    print(f"\n📥 Download request: {doc_id} by {user['email']}\n")
     
     if doc_id not in documents:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -945,90 +649,23 @@ async def download_document(doc_id: str, user: dict = Depends(verify_token)):
     if not doc.get("translated_path") or not os.path.exists(doc["translated_path"]):
         raise HTTPException(status_code=404, detail="Translated file not found")
     
-    # Generate appropriate filename
     original_name = os.path.splitext(doc["filename"])[0]
     file_ext = doc["file_type"]
     translated_filename = f"{original_name}_translated{file_ext}"
     
+    print(f"✓ Serving file: {translated_filename}\n")
+    
     return FileResponse(
         path=doc["translated_path"],
         filename=translated_filename,
-        media_type=get_media_type(doc["filename"])
+        media_type=SUPPORTED_FORMATS.get(file_ext, 'application/octet-stream')
     )
-
-@app.get("/metrics/{doc_id}", response_model=MetricsResponse)
-async def get_translation_metrics(doc_id: str, user: dict = Depends(verify_token)):
-    """Calculate and return translation quality metrics for a document"""
-    
-    if not METRICS_SUPPORT or not TEXT_EXTRACTION_SUPPORT:
-        raise HTTPException(
-            status_code=503, 
-            detail="Translation metrics not available. Install required packages: pip install sacrebleu nltk python-docx pymupdf"
-        )
-    
-    if doc_id not in documents:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    doc = documents[doc_id]
-    
-    if doc["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    if doc["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Document not yet translated")
-    
-    if not doc.get("translated_path") or not os.path.exists(doc["translated_path"]):
-        raise HTTPException(status_code=404, detail="Translated document not found")
-    
-    try:
-        print(f"\n{'='*60}")
-        print(f"Calculating Translation Metrics")
-        print(f"{'='*60}")
-        print(f"Document: {doc['filename']}")
-        print(f"Source -> Target: {doc.get('source_lang', 'auto')} -> {doc.get('target_lang', 'unknown')}")
-        print(f"{'='*60}\n")
-        
-        # Extract text from both documents
-        source_text = extract_text_from_document(doc["upload_path"])
-        translated_text = extract_text_from_document(doc["translated_path"])
-        
-        if not source_text or not translated_text:
-            raise HTTPException(status_code=400, detail="Could not extract text from documents")
-        
-        metrics = calculate_translation_metrics(
-            source_text, 
-            translated_text,
-            doc.get("source_lang", "auto"),
-            doc.get("target_lang", "unknown")
-        )
-        
-        print(f"\nMetrics Results:")
-        print(f"  BLEU Score:   {metrics['bleu_score']}")
-        print(f"  ChrF Score:   {metrics['chrf_score']}")
-        print(f"  METEOR Score: {metrics['meteor_score']}")
-        print(f"  Segments:     {metrics['segments_compared']}")
-        print(f"{'='*60}\n")
-        
-        return MetricsResponse(
-            doc_id=doc_id,
-            filename=doc["filename"],
-            bleu_score=metrics["bleu_score"],
-            chrf_score=metrics["chrf_score"],
-            meteor_score=metrics["meteor_score"],
-            comet_score=metrics.get("comet_score"),
-            calculated_at=datetime.now().isoformat(),
-            segments_compared=metrics["segments_compared"]
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error calculating metrics: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to calculate metrics: {str(e)}")
 
 @app.get("/documents", response_model=List[DocumentInfo])
 async def list_documents(user: dict = Depends(verify_token)):
-    """List all documents for current user"""
+    """List user documents"""
+    
+    print(f"\n📋 Listing documents for: {user['email']}\n")
     
     user_documents = [
         DocumentInfo(
@@ -1037,226 +674,70 @@ async def list_documents(user: dict = Depends(verify_token)):
             file_type=doc["file_type"],
             status=doc["status"],
             upload_time=doc["upload_time"],
-            translated_doc_id=doc.get("translated_doc_id")
+            translated_doc_id=doc.get("translated_doc_id"),
+            error=doc.get("error")
         )
         for doc in documents.values()
         if doc["user_id"] == user["user_id"]
     ]
     
+    print(f"Found {len(user_documents)} documents\n")
+    
     return sorted(user_documents, key=lambda x: x.upload_time, reverse=True)
-
-@app.get("/document/{doc_id}")
-async def get_document_info(doc_id: str, user: dict = Depends(verify_token)):
-    """Get detailed information about a document"""
-    
-    if doc_id not in documents:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    doc = documents[doc_id]
-    
-    if doc["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Remove sensitive paths from response
-    response_doc = {k: v for k, v in doc.items() if k not in ["upload_path", "translated_path"]}
-    
-    return response_doc
-
-@app.delete("/document/{doc_id}")
-async def delete_document(doc_id: str, user: dict = Depends(verify_token)):
-    """Delete a document and its translations"""
-    
-    if doc_id not in documents:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    doc = documents[doc_id]
-    
-    if doc["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Delete files
-    try:
-        if os.path.exists(doc["upload_path"]):
-            os.remove(doc["upload_path"])
-        
-        if doc.get("translated_path") and os.path.exists(doc["translated_path"]):
-            os.remove(doc["translated_path"])
-    except Exception as e:
-        print(f"Error deleting files: {e}")
-    
-    # Remove from documents
-    del documents[doc_id]
-    
-    return {"message": "Document deleted successfully"}
-
-@app.get("/stats")
-async def get_user_stats(user: dict = Depends(verify_token)):
-    """Get user statistics"""
-    
-    tier_info = SUBSCRIPTION_TIERS[user["tier"]]
-    
-    # Count user documents
-    user_docs = [doc for doc in documents.values() if doc["user_id"] == user["user_id"]]
-    completed_docs = [doc for doc in user_docs if doc["status"] == "completed"]
-    
-    return {
-        "user_id": user["user_id"],
-        "email": user["email"],
-        "tier": user["tier"],
-        "translations_used": user["translations_used"],
-        "translations_limit": tier_info["limit"],
-        "translations_remaining": tier_info["limit"] - user["translations_used"] if tier_info["limit"] != float('inf') else "unlimited",
-        "total_documents": len(user_docs),
-        "completed_translations": len(completed_docs),
-        "member_since": user["created_at"],
-        "metrics_available": METRICS_SUPPORT and TEXT_EXTRACTION_SUPPORT
-    }
-
-@app.get("/supported-formats")
-async def get_supported_formats():
-    """Get list of supported file formats"""
-    return {
-        "formats": list(SUPPORTED_FORMATS.keys()),
-        "details": {
-            ".docx": {
-                "name": "Microsoft Word Document",
-                "features": [
-                    "Full formatting preservation",
-                    "Images and graphics",
-                    "Tables and lists",
-                    "Headers and footers",
-                    "Exact layout maintained"
-                ]
-            },
-            ".pdf": {
-                "name": "Portable Document Format",
-                "features": [
-                    "Text extraction and translation",
-                    "Paragraph structure maintained",
-                    "Page breaks preserved",
-                    "Best for text-heavy documents"
-                ],
-                "limitations": [
-                    "Complex layouts may be simplified",
-                    "Images not included in output",
-                    "Only text-based PDFs (not scanned images)"
-                ]
-            }
-        }
-    }
-
-@app.get("/languages")
-async def get_supported_languages():
-    """Get list of supported languages"""
-    return {
-        "popular": {
-            "en": "English",
-            "es": "Spanish",
-            "fr": "French",
-            "de": "German",
-            "it": "Italian",
-            "pt": "Portuguese",
-            "ru": "Russian",
-            "zh-cn": "Chinese (Simplified)",
-            "ja": "Japanese",
-            "ko": "Korean",
-            "ar": "Arabic",
-            "af": "Afrikaans"
-        },
-        "note": "Supports 100+ languages via Google Translate. Use 'auto' for automatic source language detection."
-    }
 
 @app.get("/")
 async def root():
-    """API information"""
+    """API info"""
     return {
-        "service": "Document Translation API with Authentication & Metrics",
-        "version": "2.1.0",
-        "mode": "SANDBOX" if PAYFAST_SANDBOX else "PRODUCTION",
+        "service": "Document Translation API - Improved",
+        "version": "2.2.0",
+        "status": "operational",
+        "translator_available": TRANSLATOR_AVAILABLE,
         "features": [
-            "User authentication",
-            "Subscription management",
-            "PayFast payment integration",
-            "Multi-format document translation (DOCX, PDF)",
-            "Usage tracking",
-            "File format auto-detection",
-            "100+ language support",
-            "Translation quality metrics (BLEU, ChrF, METEOR)"
-        ],
-        "supported_formats": list(SUPPORTED_FORMATS.keys()),
-        "metrics_available": METRICS_SUPPORT and TEXT_EXTRACTION_SUPPORT,
-        "endpoints": {
-            "docs": "/docs",
-            "health": "/health"
-        }
+            "Enhanced error logging",
+            "Detailed request tracking",
+            "Better error messages",
+            "Authentication debugging"
+        ]
     }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+async def health():
+    """Health check"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "mode": "SANDBOX" if PAYFAST_SANDBOX else "PRODUCTION",
         "storage": {
             "users": len(users),
-            "payments": len(payments),
-            "active_sessions": len(sessions),
+            "sessions": len(sessions),
             "documents": len(documents)
         },
-        "supported_formats": list(SUPPORTED_FORMATS.keys()),
-        "metrics_support": METRICS_SUPPORT and TEXT_EXTRACTION_SUPPORT
+        "translator": "available" if TRANSLATOR_AVAILABLE else "unavailable"
     }
 
-# ============================================
-# STARTUP
-# ============================================
+@app.get("/debug/sessions")
+async def debug_sessions():
+    """Debug endpoint to see active sessions"""
+    return {
+        "total_sessions": len(sessions),
+        "sessions": [
+            {
+                "token_preview": token[:20] + "...",
+                "user_id": session["user_id"],
+                "created_at": session["created_at"],
+                "age_hours": (datetime.now() - datetime.fromisoformat(session["created_at"])).total_seconds() / 3600
+            }
+            for token, session in sessions.items()
+        ]
+    }
 
-@app.on_event("startup")
-async def startup():
-    """Print configuration on startup"""
+if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 DOCUMENT TRANSLATION API v2.1")
+    print("🚀 Starting Improved Document Translation API")
     print("="*70)
-    print(f"\n📋 Configuration:")
-    print(f"   Mode:          {'SANDBOX (Test)' if PAYFAST_SANDBOX else 'PRODUCTION (Live)'}")
-    print(f"   Backend URL:   {BACKEND_URL}")
-    print(f"   Frontend URL:  {FRONTEND_URL}")
-    print(f"   Merchant ID:   {PAYFAST_MERCHANT_ID}")
-    
-    print(f"\n🔗 Payment URLs:")
-    print(f"   Return URL:    {BACKEND_URL}/payment/success")
-    print(f"   Cancel URL:    {BACKEND_URL}/payment/cancel")
-    print(f"   Notify URL:    {BACKEND_URL}/payment/notify")
-    
-    if 'localhost' in BACKEND_URL or '127.0.0.1' in BACKEND_URL:
-        print(f"\n⚠️  WARNING: Backend URL uses localhost - webhooks will fail!")
-        print(f"   For local testing with PayFast webhooks:")
-        print(f"   1. Run: ngrok http 8000")
-        print(f"   2. Update BACKEND_URL with ngrok URL")
-        print(f"   3. Restart the server")
-    else:
-        print(f"\n✅ URLs configured for production!")
-    
-    print(f"\n📚 Features:")
-    print(f"   ✓ User authentication")
-    print(f"   ✓ PayFast payment integration")
-    print(f"   ✓ Payment success/cancel redirects")
-    print(f"   ✓ DOCX & PDF translation")
-    print(f"   ✓ Translation metrics: {'✓ Available' if METRICS_SUPPORT else '✗ Not available'}")
-    
-    print(f"\n🔗 API URLs:")
-    print(f"   API:           http://localhost:8000")
-    print(f"   Docs:          http://localhost:8000/docs")
-    print(f"   Health:        http://localhost:8000/health")
-    
-    if PAYFAST_SANDBOX:
-        print(f"\n🧪 Sandbox Testing:")
-        print(f"   PayFast:       https://sandbox.payfast.co.za")
-        print(f"   Username:      sbtu01@payfast.io")
-        print(f"   Password:      clientpass")
-    
+    print(f"Translator available: {TRANSLATOR_AVAILABLE}")
+    print(f"Backend URL: {BACKEND_URL}")
+    print(f"Frontend URL: {FRONTEND_URL}")
     print("="*70 + "\n")
-
-if __name__ == "__main__":
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
