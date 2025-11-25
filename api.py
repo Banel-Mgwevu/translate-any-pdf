@@ -1,5 +1,5 @@
 """
-IMPROVED API with Better Error Handling and Logging
+IMPROVED API with Payment Integration
 
 Key improvements:
 1. Request logging middleware
@@ -7,10 +7,11 @@ Key improvements:
 3. Token refresh endpoint
 4. Better translation status tracking
 5. File validation improvements
+6. PayFast payment integration
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends, Query
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -39,9 +40,9 @@ except ImportError:
     print("WARNING: document_translator not available!")
 
 app = FastAPI(
-    title="Document Translation API - Improved",
-    description="Enhanced with better error handling and logging",
-    version="2.2.0"
+    title="Document Translation API - With Payments",
+    description="Enhanced with PayFast payment integration",
+    version="2.3.0"
 )
 
 # ============================================
@@ -51,6 +52,7 @@ app = FastAPI(
 BACKEND_URL = os.getenv("BACKEND_URL", "https://translate-any-pdf.onrender.com")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://translation-app-frontend-lhk5.onrender.com")
 
+# PayFast Configuration (Sandbox for testing)
 PAYFAST_SANDBOX = True
 SANDBOX_MERCHANT_ID = "10043424"
 SANDBOX_MERCHANT_KEY = "31ujwiuzciw38"
@@ -59,6 +61,7 @@ SANDBOX_PASSPHRASE = "jt7NOE43FZPn"
 PAYFAST_MERCHANT_ID = SANDBOX_MERCHANT_ID
 PAYFAST_MERCHANT_KEY = SANDBOX_MERCHANT_KEY
 PAYFAST_PASSPHRASE = SANDBOX_PASSPHRASE
+PAYFAST_URL = "https://sandbox.payfast.co.za/eng/process" if PAYFAST_SANDBOX else "https://www.payfast.co.za/eng/process"
 
 # ============================================
 # CORS
@@ -97,7 +100,7 @@ async def log_requests(request: Request, call_next):
     # Check for auth header
     auth_header = request.headers.get("authorization")
     if auth_header:
-        token = auth_header.replace("Bearer ", "")[:20]  # Only show first 20 chars
+        token = auth_header.replace("Bearer ", "")[:20]
         print(f"Auth:    ✓ Present (token: {token}...)")
     else:
         print(f"Auth:    ✗ MISSING - Protected endpoints will fail!")
@@ -193,6 +196,9 @@ class TranslationRequest(BaseModel):
     source_lang: str = "auto"
     target_lang: str = "af"
 
+class PaymentInitiate(BaseModel):
+    tier: str
+
 class UserResponse(BaseModel):
     user_id: str
     email: str
@@ -274,6 +280,24 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     print(f"✓ User verified: {user['email']}\n")
     
     return user
+
+def generate_payfast_signature(data: dict, passphrase: str = "") -> str:
+    """Generate PayFast signature for payment verification"""
+    # Create parameter string
+    param_string = ""
+    for key in sorted(data.keys()):
+        if key != 'signature':
+            param_string += f"{key}={urllib.parse.quote_plus(str(data[key]))}&"
+    
+    # Remove last ampersand
+    param_string = param_string[:-1]
+    
+    # Add passphrase if provided
+    if passphrase:
+        param_string += f"&passphrase={urllib.parse.quote_plus(passphrase)}"
+    
+    # Generate signature
+    return hashlib.md5(param_string.encode()).hexdigest()
 
 # ============================================
 # AUTHENTICATION ENDPOINTS
@@ -425,6 +449,162 @@ async def get_current_user(user: dict = Depends(verify_token)):
         translations_limit=tier_info["limit"],
         created_at=user["created_at"]
     )
+
+# ============================================
+# PAYMENT ENDPOINTS
+# ============================================
+
+@app.post("/payment/initiate")
+async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depends(verify_token)):
+    """Initiate PayFast payment"""
+    
+    print(f"\n{'='*70}")
+    print(f"💳 PAYMENT INITIATION")
+    print(f"{'='*70}")
+    print(f"User:  {user['email']}")
+    print(f"Tier:  {payment_request.tier}")
+    print(f"{'='*70}\n")
+    
+    # Validate tier
+    if payment_request.tier not in SUBSCRIPTION_TIERS:
+        raise HTTPException(status_code=400, detail="Invalid subscription tier")
+    
+    tier = SUBSCRIPTION_TIERS[payment_request.tier]
+    
+    if tier["price"] == 0:
+        raise HTTPException(status_code=400, detail="Cannot purchase free tier")
+    
+    # Create payment ID
+    payment_id = str(uuid.uuid4())
+    
+    # Store payment record
+    payments[payment_id] = {
+        "payment_id": payment_id,
+        "user_id": user["user_id"],
+        "tier": payment_request.tier,
+        "amount": tier["price"],
+        "status": "pending",
+        "created_at": datetime.now().isoformat()
+    }
+    save_json(PAYMENTS_FILE, payments)
+    
+    # Prepare PayFast data
+    payment_data = {
+        "merchant_id": PAYFAST_MERCHANT_ID,
+        "merchant_key": PAYFAST_MERCHANT_KEY,
+        "return_url": f"{FRONTEND_URL}?payment_status=success&tier={payment_request.tier}",
+        "cancel_url": f"{FRONTEND_URL}?payment_status=cancelled",
+        "notify_url": f"{BACKEND_URL}/payment/notify",
+        "name_first": user["name"].split()[0] if user["name"] else "User",
+        "name_last": user["name"].split()[-1] if len(user["name"].split()) > 1 else "User",
+        "email_address": user["email"],
+        "m_payment_id": payment_id,
+        "amount": f"{tier['price']:.2f}",
+        "item_name": f"{tier['name']} Subscription",
+        "item_description": f"Monthly {tier['name']} subscription for document translation"
+    }
+    
+    # Generate signature
+    signature = generate_payfast_signature(payment_data, PAYFAST_PASSPHRASE)
+    payment_data["signature"] = signature
+    
+    print(f"✓ Payment initiated: {payment_id}")
+    print(f"Amount: R{tier['price']:.2f}")
+    print(f"PayFast URL: {PAYFAST_URL}\n")
+    
+    return {
+        "payment_id": payment_id,
+        "payment_url": PAYFAST_URL,
+        "payment_data": payment_data
+    }
+
+@app.post("/payment/notify")
+async def payment_notify(request: Request):
+    """Handle PayFast IPN (Instant Payment Notification)"""
+    
+    print(f"\n{'='*70}")
+    print(f"🔔 PAYMENT NOTIFICATION (IPN)")
+    print(f"{'='*70}")
+    
+    # Get form data
+    form_data = await request.form()
+    data = dict(form_data)
+    
+    print(f"Received data: {json.dumps(data, indent=2)}")
+    
+    # Verify signature
+    received_signature = data.get("signature", "")
+    calculated_signature = generate_payfast_signature(data, PAYFAST_PASSPHRASE)
+    
+    if received_signature != calculated_signature:
+        print(f"❌ Invalid signature!")
+        print(f"Received:   {received_signature}")
+        print(f"Calculated: {calculated_signature}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    # Get payment info
+    payment_id = data.get("m_payment_id")
+    payment_status = data.get("payment_status")
+    
+    if payment_id not in payments:
+        print(f"❌ Payment not found: {payment_id}")
+        raise HTTPException(status_code=404, detail="Payment not found")
+    
+    payment = payments[payment_id]
+    user_id = payment["user_id"]
+    
+    if user_id not in users:
+        print(f"❌ User not found: {user_id}")
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = users[user_id]
+    
+    # Update payment status
+    payment["status"] = payment_status
+    payment["updated_at"] = datetime.now().isoformat()
+    payment["payfast_data"] = data
+    
+    # If payment successful, update user tier
+    if payment_status == "COMPLETE":
+        print(f"✓ Payment successful!")
+        
+        user["tier"] = payment["tier"]
+        user["translations_used"] = 0  # Reset usage on upgrade
+        user["updated_at"] = datetime.now().isoformat()
+        
+        print(f"✓ User upgraded to: {payment['tier']}")
+        print(f"User: {user['email']}")
+    else:
+        print(f"⚠️ Payment status: {payment_status}")
+    
+    save_json(PAYMENTS_FILE, payments)
+    save_json(USERS_FILE, users)
+    
+    print(f"{'='*70}\n")
+    
+    return {"status": "success"}
+
+@app.get("/payment/success")
+async def payment_success(
+    payment_id: str = Query(...),
+    tier: str = Query(...)
+):
+    """Handle payment success redirect"""
+    
+    print(f"\n✓ Payment success redirect")
+    print(f"Payment ID: {payment_id}")
+    print(f"Tier: {tier}\n")
+    
+    # Redirect to frontend with success parameters
+    return RedirectResponse(url=f"{FRONTEND_URL}?payment_status=success&tier={tier}")
+
+@app.get("/payment/cancel")
+async def payment_cancel():
+    """Handle payment cancellation"""
+    
+    print(f"\n❌ Payment cancelled\n")
+    
+    return RedirectResponse(url=f"{FRONTEND_URL}?payment_status=cancelled")
 
 # ============================================
 # DOCUMENT TRANSLATION ENDPOINTS  
@@ -689,15 +869,19 @@ async def list_documents(user: dict = Depends(verify_token)):
 async def root():
     """API info"""
     return {
-        "service": "Document Translation API - Improved",
-        "version": "2.2.0",
+        "service": "Document Translation API - With Payments",
+        "version": "2.3.0",
         "status": "operational",
         "translator_available": TRANSLATOR_AVAILABLE,
+        "payment_provider": "PayFast",
+        "payment_mode": "sandbox" if PAYFAST_SANDBOX else "production",
         "features": [
             "Enhanced error logging",
             "Detailed request tracking",
             "Better error messages",
-            "Authentication debugging"
+            "Authentication debugging",
+            "PayFast payment integration",
+            "Subscription management"
         ]
     }
 
@@ -710,9 +894,11 @@ async def health():
         "storage": {
             "users": len(users),
             "sessions": len(sessions),
-            "documents": len(documents)
+            "documents": len(documents),
+            "payments": len(payments)
         },
-        "translator": "available" if TRANSLATOR_AVAILABLE else "unavailable"
+        "translator": "available" if TRANSLATOR_AVAILABLE else "unavailable",
+        "payment_integration": "configured"
     }
 
 @app.get("/debug/sessions")
@@ -731,13 +917,33 @@ async def debug_sessions():
         ]
     }
 
+@app.get("/debug/payments")
+async def debug_payments():
+    """Debug endpoint to see payment records"""
+    return {
+        "total_payments": len(payments),
+        "payments": [
+            {
+                "payment_id": payment["payment_id"],
+                "user_id": payment["user_id"],
+                "tier": payment["tier"],
+                "amount": payment["amount"],
+                "status": payment["status"],
+                "created_at": payment["created_at"]
+            }
+            for payment in payments.values()
+        ]
+    }
+
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 Starting Improved Document Translation API")
+    print("🚀 Starting Document Translation API with Payments")
     print("="*70)
     print(f"Translator available: {TRANSLATOR_AVAILABLE}")
     print(f"Backend URL: {BACKEND_URL}")
     print(f"Frontend URL: {FRONTEND_URL}")
+    print(f"PayFast Mode: {'Sandbox' if PAYFAST_SANDBOX else 'Production'}")
+    print(f"PayFast URL: {PAYFAST_URL}")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
