@@ -840,9 +840,19 @@ async def upload_document(file: UploadFile = File(...), user: dict = Depends(ver
         "message": f"File uploaded successfully. Format: {file_ext.upper()}"
     }
 
+# Update your api.py - Replace the DocumentTranslator import and usage
+
+# At the top of api.py, replace:
+# from document_translator import DocumentTranslator
+
+# With:
+# from document_translator_improved import EnhancedDocumentTranslator as DocumentTranslator
+
+# Or update the translate_document function in api.py:
+
 @app.post("/translate")
 async def translate_document(request: TranslationRequest, user: dict = Depends(verify_token)):
-    """Translate a document (DOCX or PDF)"""
+    """Translate a document (DOCX or PDF) with improved quality"""
     
     if request.doc_id not in documents:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -865,20 +875,22 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
         file_ext = doc["file_type"]
         output_path = os.path.join(OUTPUT_DIR, f"{translated_doc_id}{file_ext}")
         
-        # Initialize translator
-        translator = DocumentTranslator(
+        # Initialize IMPROVED translator
+        from document_translator_improved import EnhancedDocumentTranslator
+        translator = EnhancedDocumentTranslator(
             source_lang=request.source_lang,
             target_lang=request.target_lang
         )
         
-        # Translate document
+        # Translate document with improved context-aware method
         print(f"\n{'='*60}")
-        print(f"API Translation Request")
+        print(f"API Translation Request (Enhanced)")
         print(f"{'='*60}")
         print(f"User: {user['email']}")
         print(f"File: {doc['filename']} ({file_ext.upper()})")
         print(f"Source Lang: {request.source_lang}")
         print(f"Target Lang: {request.target_lang}")
+        print(f"Method: Context-aware translation")
         print(f"{'='*60}\n")
         
         translator.translate_document(doc["upload_path"], output_path)
@@ -896,7 +908,8 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
         save_json(USERS_FILE, users)
         
         print(f"Translation completed successfully!")
-        print(f"Translated segments: {len(translator.translation_cache)}")
+        print(f"Paragraphs translated: {len(translator.translation_cache)}")
+        print(f"Context chunks: {len(translator.context_cache)}")
         print(f"User usage: {users[user['user_id']]['translations_used']}/{tier_info['limit']}\n")
         
         return {
@@ -904,7 +917,8 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
             "status": "completed",
             "translated_doc_id": translated_doc_id,
             "file_type": file_ext,
-            "segments_translated": len(translator.translation_cache),
+            "paragraphs_translated": len(translator.translation_cache),
+            "context_chunks": len(translator.context_cache),
             "source_lang": request.source_lang,
             "target_lang": request.target_lang,
             "translations_remaining": tier_info["limit"] - users[user["user_id"]]["translations_used"]
@@ -915,7 +929,7 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
         doc["error"] = str(e)
         print(f"Translation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
-
+    
 @app.get("/download/{doc_id}")
 async def download_document(doc_id: str, user: dict = Depends(verify_token)):
     """Download a translated document"""
