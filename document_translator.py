@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Enhanced Document Translator - Improved METEOR scores and image preservation
+Document Translator - Improved Version (Drop-in Replacement)
 
-Key improvements:
-1. Context-aware translation (larger text chunks)
-2. Sentence boundary detection
-3. Better text segmentation
-4. Explicit image preservation for DOCX
-5. Translation quality optimization
+This is a drop-in replacement for your existing document_translator.py
+Uses the same class name: DocumentTranslator
+But with all the improvements for better METEOR scores and image preservation.
+
+Changes from original:
+- Context-aware translation
+- Sentence boundary detection  
+- Paragraph-level processing
+- Image verification
+- Better caching
 """
 
 import sys
@@ -27,6 +31,11 @@ try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt', quiet=True)
+
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet', quiet=True)
 
 # Add ooxml to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -53,9 +62,16 @@ def get_python_executable():
     return sys.executable
 
 
-class EnhancedDocumentTranslator:
+class DocumentTranslator:
     """
-    Enhanced translator with improved METEOR scores and image preservation
+    Improved document translator with context-aware translation
+    
+    Key improvements:
+    - Context-aware translation (better METEOR scores)
+    - Sentence boundary detection
+    - Paragraph-level processing
+    - Image verification
+    - Better caching
     """
     
     def __init__(self, source_lang='auto', target_lang='es'):
@@ -236,6 +252,18 @@ class EnhancedDocumentTranslator:
         
         return chunk
     
+    def translate_text(self, text):
+        """
+        Main translation method - uses context-aware translation
+        
+        Args:
+            text: Text to translate
+            
+        Returns:
+            Translated text
+        """
+        return self.translate_with_context(text)
+    
     def should_translate_text(self, text):
         """
         Determine if text should be translated
@@ -268,6 +296,21 @@ class EnhancedDocumentTranslator:
             return False
             
         return True
+    
+    def should_translate_node(self, node):
+        """
+        Determine if a node's text should be translated (for XML nodes)
+        
+        Args:
+            node: XML node to check
+            
+        Returns:
+            Boolean indicating if node should be translated
+        """
+        if node.nodeType != minidom.Node.TEXT_NODE:
+            return False
+            
+        return self.should_translate_text(node.nodeValue)
     
     def extract_paragraph_text(self, paragraph_node):
         """
@@ -311,7 +354,6 @@ class EnhancedDocumentTranslator:
         translated_paragraph = self.translate_with_context(paragraph_text)
         
         # Now replace text nodes with translated segments
-        # We need to distribute the translation across the text nodes
         translated_words = translated_paragraph.split()
         word_index = 0
         
@@ -360,6 +402,24 @@ class EnhancedDocumentTranslator:
             except Exception as e:
                 print(f"  Warning: Failed to translate paragraph {i + 1}: {e}")
                 continue
+    
+    def translate_xml_text_nodes(self, node):
+        """
+        Legacy method for compatibility - redirects to improved translation
+        
+        Args:
+            node: XML node to process
+        """
+        # For backward compatibility, but improved version uses translate_xml_document
+        if node.nodeType == minidom.Node.TEXT_NODE:
+            if self.should_translate_node(node):
+                original = node.nodeValue
+                translated = self.translate_text(original)
+                node.nodeValue = translated
+        
+        if node.hasChildNodes():
+            for child in list(node.childNodes):
+                self.translate_xml_text_nodes(child)
     
     def verify_images_preserved(self, doc_path):
         """
@@ -704,10 +764,10 @@ def main():
     if len(sys.argv) < 3:
         print("Enhanced Document Translator - Better METEOR scores + Image preservation")
         print("\nUsage:")
-        print("  python document_translator_improved.py <input_file> <output_file> [target_lang] [source_lang]")
+        print("  python document_translator.py <input_file> <output_file> [target_lang] [source_lang]")
         print("\nExamples:")
-        print("  python document_translator_improved.py document.docx translated.docx es")
-        print("  python document_translator_improved.py document.pdf translated.pdf fr en")
+        print("  python document_translator.py document.docx translated.docx es")
+        print("  python document_translator.py document.pdf translated.pdf fr en")
         print("\nKey Improvements:")
         print("  ✓ Context-aware translation (better METEOR scores)")
         print("  ✓ Sentence boundary detection")
@@ -731,7 +791,7 @@ def main():
         sys.exit(1)
     
     # Create translator and translate document
-    translator = EnhancedDocumentTranslator(source_lang=source_lang, target_lang=target_lang)
+    translator = DocumentTranslator(source_lang=source_lang, target_lang=target_lang)
     translator.translate_document(input_file, output_file)
 
 
