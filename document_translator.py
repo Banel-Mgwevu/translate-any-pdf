@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Document Translator - Translate DOCX and PDF documents while preserving structure
+Document Translator - Robust Version with Error Handling
 
-This application translates Word documents and PDFs while maintaining:
-- Document structure and layout
-- Text formatting (bold, italic, colors, fonts) [DOCX]
-- Images and logos [DOCX]
-- Tables and lists [DOCX]
-- Headers and footers [DOCX]
-- Basic paragraph structure [PDF]
-- Page breaks [PDF]
+This version includes:
+- Better error handling
+- Fallback to simple translation if context fails
+- More logging
+- Graceful degradation
 """
 
 import sys
@@ -22,6 +19,33 @@ from xml.dom import minidom
 import time
 import re
 
+# Try to import NLTK (optional - will fallback if not available)
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    
+    # Try to download required data
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        try:
+            nltk.download('punkt', quiet=True)
+        except:
+            pass
+    
+    try:
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        try:
+            nltk.download('wordnet', quiet=True)
+        except:
+            pass
+    
+    NLTK_AVAILABLE = True
+except:
+    NLTK_AVAILABLE = False
+    print("Warning: NLTK not available - using simple sentence splitting")
+
 # Add ooxml to path
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -31,7 +55,7 @@ try:
     DOCX_SUPPORT = True
 except ImportError:
     DOCX_SUPPORT = False
-    print("Warning: DOCX support not available. Install python-docx or ooxml module.")
+    print("Warning: DOCX support not available")
 
 # Try to import PDF libraries
 try:
@@ -39,17 +63,18 @@ try:
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
-    print("Warning: PDF support not available. Install PyMuPDF: pip install pymupdf")
+    print("Warning: PDF support not available")
 
 
 def get_python_executable():
     """Get the correct Python executable for the current platform"""
-    # Try to use the same executable that's running this script
     return sys.executable
 
 
 class DocumentTranslator:
-    """Translates DOCX and PDF documents while preserving structure"""
+    """
+    Robust document translator with fallback modes
+    """
     
     def __init__(self, source_lang='auto', target_lang='es'):
         """
@@ -62,17 +87,180 @@ class DocumentTranslator:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.translation_cache = {}
+        self.context_cache = {}
+        self.use_context = True  # Can be disabled if context mode fails
         
         # Initialize the deep-translator instance
         try:
             self.translator = GoogleTranslator(source=source_lang, target=target_lang)
+            print(f"✓ Translator initialized: {source_lang} -> {target_lang}")
         except Exception as e:
-            print(f"Warning: Failed to initialize translator: {e}")
+            print(f"✗ Failed to initialize translator: {e}")
             self.translator = None
+    
+    def split_into_sentences(self, text):
+        """
+        Split text into sentences (uses NLTK if available, otherwise simple split)
         
+        Args:
+            text: Text to split
+            
+        Returns:
+            List of sentences
+        """
+        if not text or not text.strip():
+            return []
+        
+        if NLTK_AVAILABLE:
+            try:
+                sentences = sent_tokenize(text)
+                return [s.strip() for s in sentences if s.strip()]
+            except Exception as e:
+                print(f"Warning: NLTK tokenization failed: {e}")
+                # Fall through to simple split
+        
+        # Fallback: simple splitting
+        sentences = re.split(r'[.!?]+', text)
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def translate_chunk(self, chunk):
+        """
+        Translate a single chunk of text with retry logic
+        
+        Args:
+            chunk: Text chunk to translate
+            
+        Returns:
+            Translated text
+        """
+        if not chunk or not chunk.strip():
+            return chunk
+        
+        # Check cache
+        if chunk in self.context_cache:
+            return self.context_cache[chunk]
+        
+        # Retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Add delay to avoid rate limiting
+                if attempt > 0:
+                    time.sleep(0.5 * attempt)
+                
+                # Reinitialize translator if needed
+                if self.translator is None:
+                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
+                
+                # Translate
+                translated = self.translator.translate(chunk)
+                
+                # Validate result
+                if translated is None or not translated:
+                    print(f"Warning: Translation returned empty for: '{chunk[:50]}...'")
+                    translated = chunk
+                
+                if not isinstance(translated, str):
+                    print(f"Warning: Translation returned non-string type")
+                    translated = chunk
+                
+                # Cache and return
+                self.context_cache[chunk] = translated
+                return translated
+                
+            except Exception as e:
+                print(f"Warning: Translation attempt {attempt + 1}/{max_retries} failed: {e}")
+                
+                if attempt == max_retries - 1:
+                    print(f"All retries exhausted, using original text")
+                    self.context_cache[chunk] = chunk
+                    return chunk
+                
+                # Try to recreate translator
+                try:
+                    time.sleep(0.5)
+                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
+                except Exception as recreate_error:
+                    print(f"Failed to recreate translator: {recreate_error}")
+        
+        return chunk
+    
+    def translate_with_context(self, text, max_chunk_size=500):
+        """
+        Translate text with context awareness (with fallback to simple mode)
+        
+        Args:
+            text: Text to translate
+            max_chunk_size: Maximum characters per chunk
+            
+        Returns:
+            Translated text
+        """
+        if not text or not text.strip():
+            return text
+        
+        # Check cache
+        if text in self.translation_cache:
+            return self.translation_cache[text]
+        
+        # If context mode is disabled or text is short, translate directly
+        if not self.use_context or len(text) <= max_chunk_size:
+            result = self.translate_chunk(text)
+            self.translation_cache[text] = result
+            return result
+        
+        try:
+            # Split into sentences
+            sentences = self.split_into_sentences(text)
+            
+            if not sentences:
+                return text
+            
+            # Group sentences into chunks
+            chunks = []
+            current_chunk = []
+            current_size = 0
+            
+            for sentence in sentences:
+                sentence_size = len(sentence)
+                
+                if current_size + sentence_size > max_chunk_size and current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [sentence]
+                    current_size = sentence_size
+                else:
+                    current_chunk.append(sentence)
+                    current_size += sentence_size
+            
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            
+            # Translate each chunk
+            translated_chunks = []
+            for i, chunk in enumerate(chunks):
+                translated = self.translate_chunk(chunk)
+                translated_chunks.append(translated)
+                
+                if i < len(chunks) - 1:
+                    time.sleep(0.1)
+            
+            # Join results
+            result = ' '.join(translated_chunks)
+            self.translation_cache[text] = result
+            return result
+            
+        except Exception as e:
+            print(f"Warning: Context translation failed: {e}")
+            print("Falling back to simple translation...")
+            
+            # Fallback to simple translation
+            result = self.translate_chunk(text)
+            self.translation_cache[text] = result
+            return result
+    
     def translate_text(self, text):
         """
-        Translate text with caching to avoid duplicate translations
+        Main translation method
         
         Args:
             text: Text to translate
@@ -80,75 +268,26 @@ class DocumentTranslator:
         Returns:
             Translated text
         """
-        if not text or not text.strip():
+        try:
+            return self.translate_with_context(text)
+        except Exception as e:
+            print(f"Error in translate_text: {e}")
+            # Ultimate fallback - return original
             return text
-            
-        # Check cache first
-        if text in self.translation_cache:
-            return self.translation_cache[text]
-        
-        # Retry logic for robustness
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Add delay to avoid rate limiting (increase with retries)
-                time.sleep(0.15 * (attempt + 1))
-                
-                # Reinitialize translator if needed
-                if self.translator is None:
-                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
-                
-                # Translate - deep-translator returns string directly
-                translated = self.translator.translate(text)
-                
-                # Handle None or empty returns
-                if translated is None or not translated:
-                    print(f"Warning: Translation returned None for '{text[:50]}...', using original text")
-                    translated = text
-                
-                # Validate the result is a string
-                if not isinstance(translated, str):
-                    print(f"Warning: Translation returned non-string type, using original text")
-                    translated = text
-                
-                self.translation_cache[text] = translated
-                return translated
-                
-            except Exception as e:
-                print(f"Warning: Translation attempt {attempt + 1}/{max_retries} failed for '{text[:50]}...': {e}")
-                
-                # On last retry, return original text
-                if attempt == max_retries - 1:
-                    print(f"All retries exhausted, using original text")
-                    self.translation_cache[text] = text
-                    return text
-                
-                # Try to recreate translator for next attempt
-                try:
-                    time.sleep(0.5)  # Longer delay before retry
-                    self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
-                except Exception as recreate_error:
-                    print(f"Failed to recreate translator: {recreate_error}")
-                    
-        # Fallback (should never reach here, but just in case)
-        return text
     
     def should_translate_text(self, text):
         """
         Determine if text should be translated
         
-        Some elements like email addresses, URLs, or pure numbers
-        should not be translated
-        
         Args:
             text: Text to check
             
         Returns:
-            Boolean indicating if text should be translated
+            Boolean
         """
         text = text.strip()
         
-        if not text:
+        if not text or len(text) < 2:
             return False
         
         # Don't translate email addresses
@@ -156,10 +295,10 @@ class DocumentTranslator:
             return False
         
         # Don't translate URLs
-        if text.startswith('http://') or text.startswith('https://') or text.startswith('www.'):
+        if text.startswith(('http://', 'https://', 'www.')):
             return False
         
-        # Don't translate pure numbers or dates in simple format
+        # Don't translate pure numbers
         if re.match(r'^[\d\s\-/.,]+$', text):
             return False
             
@@ -167,13 +306,13 @@ class DocumentTranslator:
     
     def should_translate_node(self, node):
         """
-        Determine if a node's text should be translated (for XML nodes)
+        Determine if a node's text should be translated
         
         Args:
-            node: XML node to check
+            node: XML node
             
         Returns:
-            Boolean indicating if node should be translated
+            Boolean
         """
         if node.nodeType != minidom.Node.TEXT_NODE:
             return False
@@ -182,179 +321,24 @@ class DocumentTranslator:
     
     def translate_xml_text_nodes(self, node):
         """
-        Recursively translate all text nodes in an XML structure
+        Translate all text nodes in XML structure
         
         Args:
             node: XML node to process
         """
-        # Process text nodes
-        if node.nodeType == minidom.Node.TEXT_NODE:
-            if self.should_translate_node(node):
-                original = node.nodeValue
-                translated = self.translate_text(original)
-                node.nodeValue = translated
-                print(f"  Translated: '{original[:50]}...' -> '{translated[:50]}...'")
-        
-        # Recursively process child nodes
-        if node.hasChildNodes():
-            for child in list(node.childNodes):
-                self.translate_xml_text_nodes(child)
-    
-    def translate_pdf(self, input_pdf, output_pdf):
-        """
-        Translate a PDF document while preserving format and structure
-        
-        Args:
-            input_pdf: Path to input PDF file
-            output_pdf: Path to output PDF file
-        """
-        if not PDF_SUPPORT:
-            raise Exception("PDF support not available. Install PyMuPDF: pip install pymupdf")
-        
-        print(f"\n{'='*60}")
-        print(f"PDF Document Translator (Format-Preserving)")
-        print(f"{'='*60}")
-        print(f"Input:  {input_pdf}")
-        print(f"Output: {output_pdf}")
-        print(f"Source Language: {self.source_lang}")
-        print(f"Target Language: {self.target_lang}")
-        print(f"{'='*60}\n")
-        
         try:
-            # Open the PDF
-            print("Step 1: Opening PDF and analyzing structure...")
-            doc = fitz.open(input_pdf)
-            num_pages = len(doc)
-            print(f"  Found {num_pages} pages")
+            if node.nodeType == minidom.Node.TEXT_NODE:
+                if self.should_translate_node(node):
+                    original = node.nodeValue
+                    translated = self.translate_text(original)
+                    node.nodeValue = translated
             
-            # Create output document
-            output_doc = fitz.open()
-            
-            # Process each page
-            total_blocks = 0
-            translated_blocks = 0
-            
-            for page_num in range(num_pages):
-                print(f"\nStep 2: Processing page {page_num + 1}/{num_pages}...")
-                page = doc[page_num]
-                
-                # Create a new page with same dimensions
-                new_page = output_doc.new_page(width=page.rect.width, height=page.rect.height)
-                
-                # Copy all non-text elements (images, drawings, etc.)
-                print(f"  Copying images and graphics...")
-                # Get page as pixmap and insert as background
-                pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
-                # Convert pixmap to image bytes
-                img_bytes = pix.tobytes("png")
-                # Insert image as background
-                new_page.insert_image(new_page.rect, stream=img_bytes, overlay=False)
-                
-                # Extract text blocks with positions and formatting
-                print(f"  Extracting text blocks with formatting...")
-                blocks = page.get_text("dict")["blocks"]
-                text_blocks = [b for b in blocks if b["type"] == 0]  # Type 0 = text
-                print(f"  Found {len(text_blocks)} text blocks")
-                
-                total_blocks += len(text_blocks)
-                
-                # Translate and overlay text blocks
-                print(f"  Translating text blocks...")
-                for block_num, block in enumerate(text_blocks):
-                    try:
-                        # Extract text from block
-                        block_text = ""
-                        for line in block.get("lines", []):
-                            for span in line.get("spans", []):
-                                block_text += span.get("text", "") + " "
-                        
-                        block_text = block_text.strip()
-                        
-                        if not block_text or not self.should_translate_text(block_text):
-                            continue
-                        
-                        # Translate the text
-                        translated_text = self.translate_text(block_text)
-                        translated_blocks += 1
-                        
-                        # Get block rectangle and first span for formatting
-                        bbox = fitz.Rect(block["bbox"])
-                        
-                        # Get font information from first span
-                        font_size = 11  # default
-                        font_name = "helv"  # default
-                        font_color = (0, 0, 0)  # default black
-                        
-                        if block.get("lines") and block["lines"][0].get("spans"):
-                            first_span = block["lines"][0]["spans"][0]
-                            font_size = first_span.get("size", 11)
-                            font_color = first_span.get("color", 0)
-                            
-                            # Convert color from int to RGB tuple
-                            if isinstance(font_color, int):
-                                # Extract RGB from integer
-                                r = (font_color >> 16) & 0xFF
-                                g = (font_color >> 8) & 0xFF
-                                b = font_color & 0xFF
-                                font_color = (r/255, g/255, b/255)
-                        
-                        # Draw white rectangle to cover original text
-                        new_page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
-                        
-                        # Insert translated text at the same position
-                        # Use text box to handle multiline text
-                        rc = new_page.insert_textbox(
-                            bbox,
-                            translated_text,
-                            fontsize=font_size,
-                            fontname=font_name,
-                            color=font_color,
-                            align=fitz.TEXT_ALIGN_LEFT
-                        )
-                        
-                        if rc < 0:
-                            # Text didn't fit, try with smaller font
-                            new_page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
-                            rc = new_page.insert_textbox(
-                                bbox,
-                                translated_text,
-                                fontsize=font_size * 0.8,
-                                fontname=font_name,
-                                color=font_color,
-                                align=fitz.TEXT_ALIGN_LEFT
-                            )
-                        
-                        if block_num % 5 == 0 and block_num > 0:
-                            print(f"    Progress: {block_num}/{len(text_blocks)} blocks")
+            if node.hasChildNodes():
+                for child in list(node.childNodes):
+                    self.translate_xml_text_nodes(child)
                     
-                    except Exception as e:
-                        print(f"    Warning: Failed to translate block {block_num}: {e}")
-                        continue
-                
-                print(f"  ✓ Page {page_num + 1} completed")
-            
-            # Save the output PDF
-            print(f"\nStep 3: Saving translated PDF...")
-            output_doc.save(output_pdf, garbage=4, deflate=True, clean=True)
-            output_doc.close()
-            doc.close()
-            
-            print(f"\n{'='*60}")
-            print(f"Translation Complete!")
-            print(f"{'='*60}")
-            print(f"Processed {num_pages} pages")
-            print(f"Total text blocks: {total_blocks}")
-            print(f"Translated blocks: {translated_blocks}")
-            print(f"Unique translations: {len(self.translation_cache)}")
-            print(f"Output saved to: {output_pdf}")
-            print(f"✓ Format and structure preserved")
-            print(f"{'='*60}\n")
-            
         except Exception as e:
-            print(f"\nError during PDF translation: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+            print(f"Warning: Failed to translate node: {e}")
     
     def translate_docx(self, input_docx, output_docx):
         """
@@ -365,10 +349,10 @@ class DocumentTranslator:
             output_docx: Path to output DOCX file
         """
         if not DOCX_SUPPORT:
-            raise Exception("DOCX support not available. Install required packages.")
+            raise Exception("DOCX support not available")
         
         print(f"\n{'='*60}")
-        print(f"DOCX Document Translator")
+        print(f"DOCX Document Translator (Robust Mode)")
         print(f"{'='*60}")
         print(f"Input:  {input_docx}")
         print(f"Output: {output_docx}")
@@ -376,17 +360,15 @@ class DocumentTranslator:
         print(f"Target Language: {self.target_lang}")
         print(f"{'='*60}\n")
         
-        # Create temporary directory for unpacking
         temp_dir = os.path.join(os.path.dirname(__file__), 'temp_translate')
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir)
         
         try:
-            # Get the correct Python executable
             python_exe = get_python_executable()
             
-            # Unpack the document
+            # Unpack
             print("Step 1: Unpacking document...")
             unpack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'unpack.py')
             
@@ -397,52 +379,42 @@ class DocumentTranslator:
             )
             
             if result.returncode != 0:
-                print(f"Error unpacking document: {result.stderr}")
-                raise Exception("Failed to unpack document")
+                raise Exception(f"Failed to unpack: {result.stderr}")
             
             print(result.stdout)
             
-            # Initialize Document object
+            # Initialize Document
             print("\nStep 2: Loading document structure...")
             doc = Document(temp_dir)
             
-            # Translate main document content
-            print("\nStep 3: Translating main document content...")
+            # Translate main content
+            print("\nStep 3: Translating main document...")
             doc_xml = doc['word/document.xml']
             self.translate_xml_text_nodes(doc_xml.dom.documentElement)
             
-            # Translate headers if they exist
+            # Translate headers/footers
             word_dir = os.path.join(doc.unpacked_path, 'word')
             if os.path.exists(word_dir):
-                header_files = [f for f in os.listdir(word_dir)
-                              if f.startswith('header') and f.endswith('.xml')]
+                for header_file in [f for f in os.listdir(word_dir) if f.startswith('header') and f.endswith('.xml')]:
+                    header_path = f'word/{header_file}'
+                    if header_path in doc.files:
+                        print(f"Translating {header_file}...")
+                        header_xml = doc[header_path]
+                        self.translate_xml_text_nodes(header_xml.dom.documentElement)
                 
-                if header_files:
-                    print("\nStep 4: Translating headers...")
-                    for header_file in header_files:
-                        header_path = f'word/{header_file}'
-                        if header_path in doc.files:
-                            header_xml = doc[header_path]
-                            self.translate_xml_text_nodes(header_xml.dom.documentElement)
-                
-                # Translate footers if they exist
-                footer_files = [f for f in os.listdir(word_dir)
-                              if f.startswith('footer') and f.endswith('.xml')]
-                
-                if footer_files:
-                    print("\nStep 5: Translating footers...")
-                    for footer_file in footer_files:
-                        footer_path = f'word/{footer_file}'
-                        if footer_path in doc.files:
-                            footer_xml = doc[footer_path]
-                            self.translate_xml_text_nodes(footer_xml.dom.documentElement)
+                for footer_file in [f for f in os.listdir(word_dir) if f.startswith('footer') and f.endswith('.xml')]:
+                    footer_path = f'word/{footer_file}'
+                    if footer_path in doc.files:
+                        print(f"Translating {footer_file}...")
+                        footer_xml = doc[footer_path]
+                        self.translate_xml_text_nodes(footer_xml.dom.documentElement)
             
-            # Save the modified document
-            print("\nStep 6: Saving translated document...")
+            # Save
+            print("\nStep 4: Saving translated document...")
             doc.save()
             
-            # Pack the document
-            print("\nStep 7: Packing translated document...")
+            # Pack
+            print("\nStep 5: Packing translated document...")
             pack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'pack.py')
             
             result = subprocess.run(
@@ -452,15 +424,14 @@ class DocumentTranslator:
             )
             
             if result.returncode != 0:
-                print(f"Error packing document: {result.stderr}")
-                raise Exception("Failed to pack document")
+                raise Exception(f"Failed to pack: {result.stderr}")
             
             print(result.stdout)
             
             print(f"\n{'='*60}")
             print(f"Translation Complete!")
             print(f"{'='*60}")
-            print(f"Translated {len(self.translation_cache)} unique text segments")
+            print(f"Translated segments: {len(self.translation_cache)}")
             print(f"Output saved to: {output_docx}")
             print(f"{'='*60}\n")
             
@@ -471,60 +442,91 @@ class DocumentTranslator:
             raise
         
         finally:
-            # Cleanup temporary directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
     
+    def translate_pdf(self, input_pdf, output_pdf):
+        """
+        Translate a PDF document
+        
+        Args:
+            input_pdf: Path to input PDF file
+            output_pdf: Path to output PDF file
+        """
+        if not PDF_SUPPORT:
+            raise Exception("PDF support not available")
+        
+        print(f"\n{'='*60}")
+        print(f"PDF Document Translator (Robust Mode)")
+        print(f"{'='*60}")
+        
+        try:
+            doc = fitz.open(input_pdf)
+            output_doc = fitz.open()
+            
+            for page_num in range(len(doc)):
+                print(f"Processing page {page_num + 1}...")
+                page = doc[page_num]
+                new_page = output_doc.new_page(width=page.rect.width, height=page.rect.height)
+                
+                # Copy background
+                pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+                img_bytes = pix.tobytes("png")
+                new_page.insert_image(new_page.rect, stream=img_bytes, overlay=False)
+                
+                # Translate text blocks
+                blocks = page.get_text("dict")["blocks"]
+                for block in blocks:
+                    if block["type"] == 0:  # text block
+                        block_text = ""
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                block_text += span.get("text", "") + " "
+                        
+                        block_text = block_text.strip()
+                        if block_text and self.should_translate_text(block_text):
+                            translated = self.translate_text(block_text)
+                            
+                            bbox = fitz.Rect(block["bbox"])
+                            font_size = 11
+                            if block.get("lines") and block["lines"][0].get("spans"):
+                                font_size = block["lines"][0]["spans"][0].get("size", 11)
+                            
+                            new_page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
+                            new_page.insert_textbox(bbox, translated, fontsize=font_size)
+            
+            output_doc.save(output_pdf)
+            output_doc.close()
+            doc.close()
+            
+            print(f"Translation complete: {output_pdf}")
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
     def translate_document(self, input_file, output_file):
         """
-        Translate a document (auto-detect DOCX or PDF)
+        Translate a document (auto-detect format)
         
         Args:
             input_file: Path to input file
             output_file: Path to output file
         """
-        # Detect file type
         if input_file.lower().endswith('.docx'):
             self.translate_docx(input_file, output_file)
         elif input_file.lower().endswith('.pdf'):
             self.translate_pdf(input_file, output_file)
         else:
-            raise ValueError("Unsupported file type. Only .docx and .pdf files are supported.")
+            raise ValueError("Unsupported file type")
 
 
 def main():
-    """Main entry point for the application"""
-    
+    """Main entry point"""
     if len(sys.argv) < 3:
-        print("Document Translator - Translate DOCX and PDF while preserving structure")
-        print("\nUsage:")
-        print("  python document_translator.py <input_file> <output_file> [target_lang] [source_lang]")
-        print("\nExamples:")
-        print("  python document_translator.py document.docx translated.docx es")
-        print("  python document_translator.py document.pdf translated.pdf fr en")
-        print("  python document_translator.py report.docx report_es.docx es auto")
-        print("\nSupported formats:")
-        print(f"  DOCX: {'✓ Available' if DOCX_SUPPORT else '✗ Not available (install ooxml module)'}")
-        print(f"  PDF:  {'✓ Available' if PDF_SUPPORT else '✗ Not available (pip install pypdf reportlab)'}")
-        print("\nCommon language codes:")
-        print("  en - English")
-        print("  es - Spanish")
-        print("  fr - French")
-        print("  de - German")
-        print("  it - Italian")
-        print("  pt - Portuguese")
-        print("  ru - Russian")
-        print("  zh-cn - Chinese (Simplified)")
-        print("  ja - Japanese")
-        print("  ko - Korean")
-        print("  ar - Arabic")
-        print("\nFeatures:")
-        print("  ✓ Auto-detects file format (DOCX or PDF)")
-        print("  ✓ Preserves document structure")
-        print("  ✓ DOCX: Keeps formatting, images, tables, headers, footers")
-        print("  ✓ PDF: Maintains paragraph structure and page breaks")
-        print("  ✓ Skips emails, URLs, and pure numbers")
-        print("  ✓ Translation caching for efficiency")
+        print("Usage: python document_translator.py <input> <output> [target_lang] [source_lang]")
         sys.exit(1)
     
     input_file = sys.argv[1]
@@ -532,25 +534,10 @@ def main():
     target_lang = sys.argv[3] if len(sys.argv) > 3 else 'es'
     source_lang = sys.argv[4] if len(sys.argv) > 4 else 'auto'
     
-    # Validate input file
     if not os.path.exists(input_file):
         print(f"Error: Input file '{input_file}' not found")
         sys.exit(1)
     
-    if not (input_file.lower().endswith('.docx') or input_file.lower().endswith('.pdf')):
-        print("Error: Input file must be a .docx or .pdf file")
-        sys.exit(1)
-    
-    # Check if format is supported
-    if input_file.lower().endswith('.docx') and not DOCX_SUPPORT:
-        print("Error: DOCX support not available. Please install required modules.")
-        sys.exit(1)
-    
-    if input_file.lower().endswith('.pdf') and not PDF_SUPPORT:
-        print("Error: PDF support not available. Please install: pip install pypdf reportlab")
-        sys.exit(1)
-    
-    # Create translator and translate document
     translator = DocumentTranslator(source_lang=source_lang, target_lang=target_lang)
     translator.translate_document(input_file, output_file)
 
