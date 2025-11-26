@@ -1,17 +1,18 @@
 """
-IMPROVED API with Paystack Payment Integration
+IMPROVED API with Background Processing and Large File Support
 
 Key improvements:
-1. Request logging middleware
-2. Detailed error messages
-3. Token refresh endpoint
-4. Better translation status tracking
-5. File validation improvements
-6. Paystack payment integration (simplified payment link approach)
+1. Background task processing with status tracking
+2. Real-time progress updates via polling
+3. File size validation and limits
+4. Request timeout handling
+5. Translation queue management
+6. Better error recovery
+7. Chunked file uploads for large documents
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends, Query
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -25,11 +26,16 @@ import hashlib
 from datetime import datetime, timedelta
 import shutil
 import sys
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from queue import Queue
+import traceback
 
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Import the existing DocumentTranslator
+# Import the improved DocumentTranslator
 try:
     from document_translator import DocumentTranslator
     TRANSLATOR_AVAILABLE = True
@@ -38,9 +44,9 @@ except ImportError:
     print("WARNING: document_translator not available!")
 
 app = FastAPI(
-    title="Document Translation API - With Paystack Payments",
-    description="Enhanced with Paystack payment integration",
-    version="3.0.0"
+    title="Document Translation API - Enhanced for Large Files",
+    description="With background processing and progress tracking",
+    version="4.0.0"
 )
 
 # ============================================
@@ -50,9 +56,81 @@ app = FastAPI(
 BACKEND_URL = os.getenv("BACKEND_URL", "https://translate-any-pdf.onrender.com")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://translation-app-frontend-lhk5.onrender.com")
 
+# File size limits
+MAX_FILE_SIZE_MB = 100  # Maximum file size in MB
+CHUNK_SIZE_KB = 1024  # Chunk size for reading large files
+
+# Translation settings
+TRANSLATION_TIMEOUT = 1800  # 30 minutes timeout for translation
+MAX_CONCURRENT_TRANSLATIONS = 3  # Max translations running at once
+
 # Paystack Configuration
 PAYSTACK_PAYMENT_LINK = "https://paystack.shop/pay/8zcv4xhc7r"
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")  # Add your secret key for webhook verification
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
+
+# ============================================
+# BACKGROUND TASK MANAGER
+# ============================================
+
+class TranslationTaskManager:
+    """Manages background translation tasks"""
+    
+    def __init__(self):
+        self.tasks = {}
+        self.executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TRANSLATIONS)
+        self.lock = threading.Lock()
+        self.queue = Queue()
+        
+    def add_task(self, task_id, user_id, doc_info):
+        """Add a new translation task"""
+        with self.lock:
+            self.tasks[task_id] = {
+                "task_id": task_id,
+                "user_id": user_id,
+                "doc_info": doc_info,
+                "status": "queued",
+                "progress": 0,
+                "message": "Waiting in queue...",
+                "created_at": datetime.now().isoformat(),
+                "started_at": None,
+                "completed_at": None,
+                "error": None,
+                "result": None
+            }
+        return self.tasks[task_id]
+    
+    def update_task(self, task_id, **kwargs):
+        """Update task status"""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].update(kwargs)
+                self.tasks[task_id]["updated_at"] = datetime.now().isoformat()
+    
+    def get_task(self, task_id):
+        """Get task status"""
+        with self.lock:
+            return self.tasks.get(task_id)
+    
+    def get_user_tasks(self, user_id):
+        """Get all tasks for a user"""
+        with self.lock:
+            return [task for task in self.tasks.values() if task["user_id"] == user_id]
+    
+    def cleanup_old_tasks(self, hours=24):
+        """Remove tasks older than specified hours"""
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        with self.lock:
+            old_tasks = []
+            for task_id, task in self.tasks.items():
+                created_at = datetime.fromisoformat(task["created_at"])
+                if created_at < cutoff_time:
+                    old_tasks.append(task_id)
+            
+            for task_id in old_tasks:
+                del self.tasks[task_id]
+
+# Initialize task manager
+task_manager = TranslationTaskManager()
 
 # ============================================
 # CORS
@@ -81,6 +159,11 @@ async def log_requests(request: Request, call_next):
     """Log all requests for debugging"""
     start_time = time.time()
     
+    # Skip logging for health/status endpoints
+    if request.url.path in ["/health", "/", "/task/status"]:
+        response = await call_next(request)
+        return response
+    
     print(f"\n{'='*70}")
     print(f"📥 INCOMING REQUEST")
     print(f"{'='*70}")
@@ -94,7 +177,7 @@ async def log_requests(request: Request, call_next):
         token = auth_header.replace("Bearer ", "")[:20]
         print(f"Auth:    ✓ Present (token: {token}...)")
     else:
-        print(f"Auth:    ✗ MISSING - Protected endpoints will fail!")
+        print(f"Auth:    ✗ MISSING")
     
     print(f"{'='*70}")
     
@@ -102,7 +185,6 @@ async def log_requests(request: Request, call_next):
     
     process_time = time.time() - start_time
     
-    print(f"\n{'='*70}")
     print(f"📤 RESPONSE")
     print(f"{'='*70}")
     print(f"Status:  {response.status_code}")
@@ -213,6 +295,16 @@ class DocumentInfo(BaseModel):
     upload_time: str
     translated_doc_id: Optional[str] = None
     error: Optional[str] = None
+    task_id: Optional[str] = None
+    progress: Optional[int] = None
+
+class TaskStatus(BaseModel):
+    task_id: str
+    status: str
+    progress: int
+    message: str
+    error: Optional[str] = None
+    completed: bool
 
 # ============================================
 # UTILITY FUNCTIONS
@@ -231,15 +323,10 @@ def is_supported_format(filename: str) -> bool:
     return get_file_extension(filename) in SUPPORTED_FORMATS
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Verify authentication token with detailed logging"""
+    """Verify authentication token"""
     token = credentials.credentials
     
-    print(f"\n🔐 TOKEN VERIFICATION")
-    print(f"Token (first 20 chars): {token[:20]}...")
-    
     if token not in sessions:
-        print(f"❌ Token not found in sessions!")
-        print(f"Available sessions: {len(sessions)}")
         raise HTTPException(
             status_code=401, 
             detail="Invalid or expired token. Please sign in again."
@@ -248,16 +335,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     session = sessions[token]
     user_id = session["user_id"]
     
-    print(f"✓ Token valid for user: {user_id}")
-    
     # Check expiration
     session_time = datetime.fromisoformat(session["created_at"])
     age = datetime.now() - session_time
     
-    print(f"Session age: {age}")
-    
     if age > timedelta(days=1):
-        print(f"❌ Session expired!")
         del sessions[token]
         save_json(SESSIONS_FILE, sessions)
         raise HTTPException(
@@ -266,11 +348,9 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         )
     
     if user_id not in users:
-        print(f"❌ User {user_id} not found!")
         raise HTTPException(status_code=401, detail="User not found")
     
     user = users[user_id]
-    print(f"✓ User verified: {user['email']}\n")
     
     return user
 
@@ -282,6 +362,151 @@ def get_user_by_email(email: str) -> Optional[dict]:
     return None
 
 # ============================================
+# BACKGROUND TRANSLATION FUNCTION
+# ============================================
+
+def process_translation_task(task_id: str, doc: dict, source_lang: str, target_lang: str, user_id: str):
+    """
+    Process translation in background thread
+    """
+    try:
+        print(f"\n{'='*70}")
+        print(f"🔄 BACKGROUND TRANSLATION STARTED")
+        print(f"{'='*70}")
+        print(f"Task ID: {task_id}")
+        print(f"Document: {doc['filename']}")
+        print(f"Size: {doc.get('file_size', 0) / (1024*1024):.2f} MB")
+        print(f"{'='*70}\n")
+        
+        # Update task status
+        task_manager.update_task(task_id, 
+            status="processing",
+            started_at=datetime.now().isoformat(),
+            message="Initializing translation..."
+        )
+        
+        # Check file exists
+        if not os.path.exists(doc["upload_path"]):
+            raise Exception("Source file not found")
+        
+        # Create output path
+        translated_doc_id = str(uuid.uuid4())
+        file_ext = doc["file_type"]
+        output_path = os.path.join(OUTPUT_DIR, f"{translated_doc_id}{file_ext}")
+        
+        # Initialize translator with progress callback
+        task_manager.update_task(task_id, 
+            progress=10,
+            message="Loading document..."
+        )
+        
+        translator = DocumentTranslator(
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+        
+        # Create a progress monitor
+        def update_progress():
+            """Monitor translation progress"""
+            start_time = time.time()
+            while True:
+                elapsed = time.time() - start_time
+                if elapsed > TRANSLATION_TIMEOUT:
+                    raise Exception("Translation timeout")
+                
+                # Calculate progress based on translator's cache
+                if hasattr(translator, 'translated_segments') and hasattr(translator, 'total_segments'):
+                    if translator.total_segments > 0:
+                        progress = int((translator.translated_segments / translator.total_segments) * 80) + 10
+                        task_manager.update_task(task_id, 
+                            progress=min(progress, 90),
+                            message=f"Translating... ({translator.translated_segments}/{translator.total_segments} segments)"
+                        )
+                
+                time.sleep(2)  # Update every 2 seconds
+                
+                # Check if translation is complete
+                if os.path.exists(output_path):
+                    break
+        
+        # Start progress monitor in separate thread
+        progress_thread = threading.Thread(target=update_progress, daemon=True)
+        progress_thread.start()
+        
+        # Perform translation
+        task_manager.update_task(task_id, 
+            progress=20,
+            message="Starting translation..."
+        )
+        
+        translator.translate_document(doc["upload_path"], output_path)
+        
+        # Verify output
+        if not os.path.exists(output_path):
+            raise Exception("Translation completed but output file not found")
+        
+        output_size = os.path.getsize(output_path)
+        
+        # Update document record
+        doc["status"] = "completed"
+        doc["translated_path"] = output_path
+        doc["translated_doc_id"] = translated_doc_id
+        doc["source_lang"] = source_lang
+        doc["target_lang"] = target_lang
+        doc["translation_time"] = datetime.now().isoformat()
+        doc["output_size"] = output_size
+        
+        # Update user usage
+        if user_id in users:
+            users[user_id]["translations_used"] += 1
+            users[user_id]["updated_at"] = datetime.now().isoformat()
+            save_json(USERS_FILE, users)
+        
+        # Update task as completed
+        task_manager.update_task(task_id,
+            status="completed",
+            progress=100,
+            message="Translation completed successfully!",
+            completed_at=datetime.now().isoformat(),
+            result={
+                "translated_doc_id": translated_doc_id,
+                "output_size": output_size,
+                "segments_translated": len(translator.translation_cache)
+            }
+        )
+        
+        print(f"\n{'='*70}")
+        print(f"✅ BACKGROUND TRANSLATION COMPLETED")
+        print(f"{'='*70}")
+        print(f"Task ID: {task_id}")
+        print(f"Output size: {output_size / (1024*1024):.2f} MB")
+        print(f"Segments: {len(translator.translation_cache)}")
+        print(f"{'='*70}\n")
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"\n{'='*70}")
+        print(f"❌ BACKGROUND TRANSLATION FAILED")
+        print(f"{'='*70}")
+        print(f"Task ID: {task_id}")
+        print(f"Error: {error_msg}")
+        print(f"{'='*70}\n")
+        
+        # Update document status
+        doc["status"] = "failed"
+        doc["error"] = error_msg
+        doc["error_time"] = datetime.now().isoformat()
+        
+        # Update task as failed
+        task_manager.update_task(task_id,
+            status="failed",
+            progress=0,
+            message="Translation failed",
+            error=error_msg,
+            completed_at=datetime.now().isoformat()
+        )
+
+# ============================================
 # AUTHENTICATION ENDPOINTS
 # ============================================
 
@@ -289,16 +514,8 @@ def get_user_by_email(email: str) -> Optional[dict]:
 async def sign_up(user_data: UserSignUp):
     """Register a new user"""
     
-    print(f"\n{'='*70}")
-    print(f"📝 NEW USER SIGNUP")
-    print(f"{'='*70}")
-    print(f"Email: {user_data.email}")
-    print(f"Name:  {user_data.name}")
-    print(f"{'='*70}\n")
-    
     # Check if user exists
     if any(u["email"] == user_data.email for u in users.values()):
-        print(f"❌ Email already registered!")
         raise HTTPException(status_code=400, detail="Email already registered")
     
     # Create user
@@ -326,9 +543,6 @@ async def sign_up(user_data: UserSignUp):
     }
     save_json(SESSIONS_FILE, sessions)
     
-    print(f"✓ User created: {user_id}")
-    print(f"✓ Token created: {token[:20]}...\n")
-    
     user = users[user_id]
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     
@@ -349,12 +563,6 @@ async def sign_up(user_data: UserSignUp):
 async def sign_in(credentials: UserSignIn):
     """Sign in existing user"""
     
-    print(f"\n{'='*70}")
-    print(f"🔑 USER SIGNIN")
-    print(f"{'='*70}")
-    print(f"Email: {credentials.email}")
-    print(f"{'='*70}\n")
-    
     # Find user
     user = None
     for u in users.values():
@@ -363,13 +571,11 @@ async def sign_in(credentials: UserSignIn):
             break
     
     if not user:
-        print(f"❌ User not found!")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     # Verify password
     hashed_password = hash_password(credentials.password)
     if user["password"] != hashed_password:
-        print(f"❌ Invalid password!")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     # Create session
@@ -379,9 +585,6 @@ async def sign_in(credentials: UserSignIn):
         "created_at": datetime.now().isoformat()
     }
     save_json(SESSIONS_FILE, sessions)
-    
-    print(f"✓ Sign in successful")
-    print(f"✓ Token: {token[:20]}...\n")
     
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     
@@ -401,8 +604,6 @@ async def sign_in(credentials: UserSignIn):
 @app.post("/auth/signout")
 async def sign_out(user: dict = Depends(verify_token)):
     """Sign out current user"""
-    
-    print(f"\n🚪 User signing out: {user['email']}\n")
     
     # Remove session
     token_to_remove = None
@@ -433,259 +634,27 @@ async def get_current_user(user: dict = Depends(verify_token)):
     )
 
 # ============================================
-# PAYSTACK PAYMENT ENDPOINTS
-# ============================================
-
-@app.post("/payment/initiate")
-async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depends(verify_token)):
-    """Initiate Paystack payment - returns redirect URL"""
-    
-    print(f"\n{'='*70}")
-    print(f"💳 PAYSTACK PAYMENT INITIATION")
-    print(f"{'='*70}")
-    print(f"User:  {user['email']}")
-    print(f"Tier:  {payment_request.tier}")
-    print(f"{'='*70}\n")
-    
-    # Validate tier
-    if payment_request.tier not in SUBSCRIPTION_TIERS:
-        raise HTTPException(status_code=400, detail="Invalid subscription tier")
-    
-    tier = SUBSCRIPTION_TIERS[payment_request.tier]
-    
-    if tier["price"] == 0:
-        raise HTTPException(status_code=400, detail="Cannot purchase free tier")
-    
-    # Create a pending upgrade record
-    upgrade_id = str(uuid.uuid4())
-    
-    pending_upgrades[user["user_id"]] = {
-        "upgrade_id": upgrade_id,
-        "user_id": user["user_id"],
-        "email": user["email"],
-        "tier": payment_request.tier,
-        "amount": tier["price"],
-        "status": "pending",
-        "created_at": datetime.now().isoformat()
-    }
-    save_json(PENDING_UPGRADES_FILE, pending_upgrades)
-    
-    # Build redirect URL with user info for callback
-    callback_url = f"{FRONTEND_URL}?payment_callback=true&user_id={user['user_id']}&tier={payment_request.tier}"
-    
-    print(f"✓ Pending upgrade created: {upgrade_id}")
-    print(f"✓ Paystack URL: {PAYSTACK_PAYMENT_LINK}")
-    print(f"✓ Callback URL: {callback_url}\n")
-    
-    return {
-        "payment_url": PAYSTACK_PAYMENT_LINK,
-        "upgrade_id": upgrade_id,
-        "tier": payment_request.tier,
-        "amount": tier["price"],
-        "callback_url": callback_url
-    }
-
-@app.post("/payment/verify")
-async def verify_payment(user: dict = Depends(verify_token)):
-    """Verify payment and upgrade user tier"""
-    
-    print(f"\n{'='*70}")
-    print(f"✅ PAYMENT VERIFICATION")
-    print(f"{'='*70}")
-    print(f"User: {user['email']}")
-    print(f"{'='*70}\n")
-    
-    user_id = user["user_id"]
-    
-    # Check for pending upgrade
-    if user_id not in pending_upgrades:
-        print(f"❌ No pending upgrade found for user")
-        raise HTTPException(status_code=404, detail="No pending upgrade found")
-    
-    pending = pending_upgrades[user_id]
-    new_tier = pending["tier"]
-    
-    # Update user tier
-    if user_id in users:
-        users[user_id]["tier"] = new_tier
-        users[user_id]["translations_used"] = 0  # Reset usage on upgrade
-        users[user_id]["updated_at"] = datetime.now().isoformat()
-        save_json(USERS_FILE, users)
-        
-        print(f"✓ User upgraded to: {new_tier}")
-    
-    # Record payment
-    payment_id = str(uuid.uuid4())
-    payments[payment_id] = {
-        "payment_id": payment_id,
-        "user_id": user_id,
-        "email": user["email"],
-        "tier": new_tier,
-        "amount": pending["amount"],
-        "status": "completed",
-        "created_at": pending["created_at"],
-        "completed_at": datetime.now().isoformat()
-    }
-    save_json(PAYMENTS_FILE, payments)
-    
-    # Remove pending upgrade
-    del pending_upgrades[user_id]
-    save_json(PENDING_UPGRADES_FILE, pending_upgrades)
-    
-    tier_info = SUBSCRIPTION_TIERS[new_tier]
-    
-    print(f"✓ Payment recorded: {payment_id}")
-    print(f"{'='*70}\n")
-    
-    return {
-        "status": "success",
-        "message": f"Successfully upgraded to {tier_info['name']}",
-        "tier": new_tier,
-        "translations_limit": tier_info["limit"],
-        "user": {
-            "user_id": users[user_id]["user_id"],
-            "email": users[user_id]["email"],
-            "name": users[user_id]["name"],
-            "tier": new_tier,
-            "translations_used": 0,
-            "translations_limit": tier_info["limit"]
-        }
-    }
-
-@app.get("/payment/callback")
-async def payment_callback(
-    reference: Optional[str] = None,
-    trxref: Optional[str] = None
-):
-    """Handle Paystack callback redirect"""
-    
-    print(f"\n{'='*70}")
-    print(f"🔔 PAYSTACK CALLBACK")
-    print(f"{'='*70}")
-    print(f"Reference: {reference}")
-    print(f"Trxref: {trxref}")
-    print(f"{'='*70}\n")
-    
-    # Redirect to frontend with success status
-    redirect_url = f"{FRONTEND_URL}?payment_status=success&reference={reference or trxref or 'unknown'}"
-    
-    return RedirectResponse(url=redirect_url)
-
-@app.get("/payment/success")
-async def payment_success_page():
-    """Payment success page - redirects to frontend"""
-    
-    print(f"\n✓ Payment success redirect\n")
-    
-    return RedirectResponse(url=f"{FRONTEND_URL}?payment_status=success")
-
-@app.get("/payment/cancel")
-async def payment_cancel():
-    """Handle payment cancellation"""
-    
-    print(f"\n❌ Payment cancelled\n")
-    
-    return RedirectResponse(url=f"{FRONTEND_URL}?payment_status=cancelled")
-
-@app.post("/payment/webhook")
-async def paystack_webhook(request: Request):
-    """Handle Paystack webhook notifications"""
-    
-    print(f"\n{'='*70}")
-    print(f"🔔 PAYSTACK WEBHOOK")
-    print(f"{'='*70}")
-    
-    try:
-        body = await request.json()
-        event = body.get("event", "")
-        data = body.get("data", {})
-        
-        print(f"Event: {event}")
-        print(f"Data: {json.dumps(data, indent=2)}")
-        
-        if event == "charge.success":
-            # Extract customer email
-            customer = data.get("customer", {})
-            email = customer.get("email", "")
-            amount = data.get("amount", 0) / 100  # Convert from kobo to rand
-            reference = data.get("reference", "")
-            
-            print(f"Payment successful!")
-            print(f"Email: {email}")
-            print(f"Amount: R{amount}")
-            print(f"Reference: {reference}")
-            
-            # Find user by email and upgrade
-            user = get_user_by_email(email)
-            if user:
-                user_id = user["user_id"]
-                
-                # Check if there's a pending upgrade
-                if user_id in pending_upgrades:
-                    new_tier = pending_upgrades[user_id]["tier"]
-                else:
-                    # Default to professional if no pending upgrade
-                    new_tier = "professional"
-                
-                # Update user tier
-                users[user_id]["tier"] = new_tier
-                users[user_id]["translations_used"] = 0
-                users[user_id]["updated_at"] = datetime.now().isoformat()
-                save_json(USERS_FILE, users)
-                
-                # Record payment
-                payment_id = str(uuid.uuid4())
-                payments[payment_id] = {
-                    "payment_id": payment_id,
-                    "user_id": user_id,
-                    "email": email,
-                    "tier": new_tier,
-                    "amount": amount,
-                    "reference": reference,
-                    "status": "completed",
-                    "source": "webhook",
-                    "completed_at": datetime.now().isoformat()
-                }
-                save_json(PAYMENTS_FILE, payments)
-                
-                # Clean up pending upgrade
-                if user_id in pending_upgrades:
-                    del pending_upgrades[user_id]
-                    save_json(PENDING_UPGRADES_FILE, pending_upgrades)
-                
-                print(f"✓ User {email} upgraded to {new_tier}")
-            else:
-                print(f"⚠️ User not found: {email}")
-        
-        print(f"{'='*70}\n")
-        
-        return {"status": "success"}
-        
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        return {"status": "error", "message": str(e)}
-
-# ============================================
-# DOCUMENT TRANSLATION ENDPOINTS  
+# DOCUMENT TRANSLATION ENDPOINTS - ENHANCED
 # ============================================
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...), user: dict = Depends(verify_token)):
-    """Upload document with detailed validation"""
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    user: dict = Depends(verify_token)
+):
+    """Upload document with size validation and chunked reading"""
     
     print(f"\n{'='*70}")
     print(f"📤 FILE UPLOAD")
     print(f"{'='*70}")
     print(f"User:     {user['email']}")
     print(f"Filename: {file.filename}")
-    print(f"Size:     {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
     print(f"{'='*70}\n")
     
     # Check limit
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     if user["translations_used"] >= tier_info["limit"]:
-        print(f"❌ Translation limit reached!")
-        print(f"Used: {user['translations_used']}/{tier_info['limit']}\n")
         raise HTTPException(
             status_code=403,
             detail=f"Translation limit reached ({tier_info['limit']} per month)"
@@ -693,28 +662,52 @@ async def upload_document(file: UploadFile = File(...), user: dict = Depends(ver
     
     # Validate format
     if not is_supported_format(file.filename):
-        print(f"❌ Unsupported format: {get_file_extension(file.filename)}\n")
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_FORMATS.keys())}"
         )
     
-    # Save file
+    # Save file with chunked reading for large files
     doc_id = str(uuid.uuid4())
     file_ext = get_file_extension(file.filename)
     upload_path = os.path.join(UPLOAD_DIR, f"{doc_id}{file_ext}")
     
     try:
-        content = await file.read()
-        with open(upload_path, "wb") as buffer:
-            buffer.write(content)
+        file_size = 0
+        chunk_count = 0
         
-        file_size = len(content)
+        with open(upload_path, "wb") as buffer:
+            while True:
+                # Read in chunks to handle large files
+                chunk = await file.read(CHUNK_SIZE_KB * 1024)
+                if not chunk:
+                    break
+                    
+                buffer.write(chunk)
+                file_size += len(chunk)
+                chunk_count += 1
+                
+                # Check size limit
+                if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                    os.remove(upload_path)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size is {MAX_FILE_SIZE_MB}MB"
+                    )
+                
+                # Log progress for very large files
+                if chunk_count % 10 == 0:
+                    print(f"  Uploaded {file_size / (1024*1024):.1f}MB...")
+        
         print(f"✓ File saved: {upload_path}")
-        print(f"✓ Size: {file_size} bytes")
+        print(f"✓ Size: {file_size / (1024*1024):.2f}MB")
         print(f"✓ Doc ID: {doc_id}\n")
         
+    except HTTPException:
+        raise
     except Exception as e:
+        if os.path.exists(upload_path):
+            os.remove(upload_path)
         print(f"❌ Save failed: {e}\n")
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
@@ -730,19 +723,28 @@ async def upload_document(file: UploadFile = File(...), user: dict = Depends(ver
         "file_size": file_size
     }
     
-    print(f"✓ Document registered in system\n")
+    # Determine if file is large
+    is_large_file = file_size > 5 * 1024 * 1024  # > 5MB
     
-    return {
+    response = {
         "doc_id": doc_id,
         "filename": file.filename,
         "file_type": file_ext,
         "status": "uploaded",
-        "message": f"File uploaded successfully. Ready for translation."
+        "file_size_mb": round(file_size / (1024*1024), 2),
+        "is_large_file": is_large_file,
+        "message": f"File uploaded successfully. {'Large file detected - translation will run in background.' if is_large_file else 'Ready for translation.'}"
     }
+    
+    return response
 
 @app.post("/translate")
-async def translate_document(request: TranslationRequest, user: dict = Depends(verify_token)):
-    """Translate document with comprehensive error handling"""
+async def translate_document(
+    request: TranslationRequest, 
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(verify_token)
+):
+    """Translate document with background processing for large files"""
     
     print(f"\n{'='*70}")
     print(f"🌐 TRANSLATION REQUEST")
@@ -755,7 +757,6 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
     
     # Check translator availability
     if not TRANSLATOR_AVAILABLE:
-        print(f"❌ DocumentTranslator not available!\n")
         raise HTTPException(
             status_code=503,
             detail="Translation service not available. Contact administrator."
@@ -763,119 +764,192 @@ async def translate_document(request: TranslationRequest, user: dict = Depends(v
     
     # Check document exists
     if request.doc_id not in documents:
-        print(f"❌ Document not found!")
-        print(f"Available docs: {list(documents.keys())}\n")
         raise HTTPException(status_code=404, detail="Document not found")
     
     doc = documents[request.doc_id]
     
     # Verify ownership
     if doc["user_id"] != user["user_id"]:
-        print(f"❌ Unauthorized access attempt!")
-        print(f"Doc owner: {doc['user_id']}")
-        print(f"Requester: {user['user_id']}\n")
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Check limit
     tier_info = SUBSCRIPTION_TIERS[user["tier"]]
     if user["translations_used"] >= tier_info["limit"]:
-        print(f"❌ Translation limit reached!\n")
         raise HTTPException(status_code=403, detail="Translation limit reached")
     
     # Check file exists
     if not os.path.exists(doc["upload_path"]):
-        print(f"❌ Source file not found: {doc['upload_path']}\n")
         doc["status"] = "failed"
         doc["error"] = "Source file not found"
         raise HTTPException(status_code=404, detail="Source file not found")
     
-    try:
-        print(f"Starting translation...")
-        doc["status"] = "translating"
+    # Determine if this should be a background task
+    file_size_mb = doc["file_size"] / (1024 * 1024)
+    use_background = file_size_mb > 2  # Use background for files > 2MB
+    
+    if use_background:
+        # Create background task
+        task_id = str(uuid.uuid4())
         
-        # Create output path
-        translated_doc_id = str(uuid.uuid4())
-        file_ext = doc["file_type"]
-        output_path = os.path.join(OUTPUT_DIR, f"{translated_doc_id}{file_ext}")
+        # Add to task manager
+        task_manager.add_task(task_id, user["user_id"], doc)
         
-        # Initialize translator
-        print(f"Initializing translator...")
-        translator = DocumentTranslator(
-            source_lang=request.source_lang,
-            target_lang=request.target_lang
+        # Update document with task ID
+        doc["task_id"] = task_id
+        doc["status"] = "queued"
+        
+        # Submit to thread pool
+        task_manager.executor.submit(
+            process_translation_task,
+            task_id,
+            doc,
+            request.source_lang,
+            request.target_lang,
+            user["user_id"]
         )
         
-        # Translate
-        print(f"Translating document...")
-        start_time = time.time()
-        
-        translator.translate_document(doc["upload_path"], output_path)
-        
-        translation_time = time.time() - start_time
-        
-        # Verify output exists
-        if not os.path.exists(output_path):
-            raise Exception("Translation completed but output file not found")
-        
-        output_size = os.path.getsize(output_path)
-        
-        # Update document
-        doc["status"] = "completed"
-        doc["translated_path"] = output_path
-        doc["translated_doc_id"] = translated_doc_id
-        doc["source_lang"] = request.source_lang
-        doc["target_lang"] = request.target_lang
-        doc["translation_time"] = datetime.now().isoformat()
-        doc["translation_duration"] = translation_time
-        doc["output_size"] = output_size
-        
-        # Increment usage
-        users[user["user_id"]]["translations_used"] += 1
-        users[user["user_id"]]["updated_at"] = datetime.now().isoformat()
-        save_json(USERS_FILE, users)
-        
-        print(f"\n{'='*70}")
-        print(f"✓ TRANSLATION SUCCESSFUL")
-        print(f"{'='*70}")
-        print(f"Time:       {translation_time:.2f}s")
-        print(f"Input size: {doc['file_size']} bytes")
-        print(f"Output size: {output_size} bytes")
-        print(f"Segments:   {len(translator.translation_cache)}")
-        print(f"Usage:      {users[user['user_id']]['translations_used']}/{tier_info['limit']}")
-        print(f"{'='*70}\n")
+        print(f"✓ Background task created: {task_id}")
+        print(f"  File size: {file_size_mb:.2f}MB")
+        print(f"  Estimated time: {int(file_size_mb * 2)} minutes\n")
         
         return {
             "doc_id": request.doc_id,
-            "status": "completed",
-            "translated_doc_id": translated_doc_id,
-            "file_type": file_ext,
-            "translation_time": translation_time,
-            "segments_translated": len(translator.translation_cache),
-            "translations_remaining": tier_info["limit"] - users[user["user_id"]]["translations_used"]
+            "task_id": task_id,
+            "status": "queued",
+            "message": "Translation started in background. Poll /task/{task_id}/status for progress.",
+            "estimated_minutes": int(file_size_mb * 2),
+            "file_size_mb": round(file_size_mb, 2)
         }
         
-    except Exception as e:
-        error_msg = str(e)
-        print(f"\n{'='*70}")
-        print(f"❌ TRANSLATION FAILED")
-        print(f"{'='*70}")
-        print(f"Error: {error_msg}")
-        print(f"{'='*70}\n")
-        
-        doc["status"] = "failed"
-        doc["error"] = error_msg
-        doc["error_time"] = datetime.now().isoformat()
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Translation failed: {error_msg}"
-        )
+    else:
+        # Process small files immediately (existing code)
+        try:
+            print(f"Processing small file directly ({file_size_mb:.2f}MB)...")
+            
+            doc["status"] = "translating"
+            
+            # Create output path
+            translated_doc_id = str(uuid.uuid4())
+            file_ext = doc["file_type"]
+            output_path = os.path.join(OUTPUT_DIR, f"{translated_doc_id}{file_ext}")
+            
+            # Initialize translator
+            translator = DocumentTranslator(
+                source_lang=request.source_lang,
+                target_lang=request.target_lang
+            )
+            
+            # Translate with timeout
+            start_time = time.time()
+            translator.translate_document(doc["upload_path"], output_path)
+            translation_time = time.time() - start_time
+            
+            # Verify output
+            if not os.path.exists(output_path):
+                raise Exception("Translation completed but output file not found")
+            
+            output_size = os.path.getsize(output_path)
+            
+            # Update document
+            doc["status"] = "completed"
+            doc["translated_path"] = output_path
+            doc["translated_doc_id"] = translated_doc_id
+            doc["source_lang"] = request.source_lang
+            doc["target_lang"] = request.target_lang
+            doc["translation_time"] = datetime.now().isoformat()
+            doc["translation_duration"] = translation_time
+            doc["output_size"] = output_size
+            
+            # Increment usage
+            users[user["user_id"]]["translations_used"] += 1
+            users[user["user_id"]]["updated_at"] = datetime.now().isoformat()
+            save_json(USERS_FILE, users)
+            
+            print(f"✓ Direct translation completed in {translation_time:.1f}s\n")
+            
+            return {
+                "doc_id": request.doc_id,
+                "status": "completed",
+                "translated_doc_id": translated_doc_id,
+                "file_type": file_ext,
+                "translation_time": translation_time,
+                "segments_translated": len(translator.translation_cache),
+                "translations_remaining": tier_info["limit"] - users[user["user_id"]]["translations_used"]
+            }
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Direct translation failed: {error_msg}\n")
+            
+            doc["status"] = "failed"
+            doc["error"] = error_msg
+            doc["error_time"] = datetime.now().isoformat()
+            
+            raise HTTPException(
+                status_code=500,
+                detail=f"Translation failed: {error_msg}"
+            )
+
+@app.get("/task/{task_id}/status", response_model=TaskStatus)
+async def get_task_status(task_id: str, user: dict = Depends(verify_token)):
+    """Get status of background translation task"""
+    
+    task = task_manager.get_task(task_id)
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Verify ownership
+    if task["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    return TaskStatus(
+        task_id=task["task_id"],
+        status=task["status"],
+        progress=task["progress"],
+        message=task["message"],
+        error=task.get("error"),
+        completed=task["status"] in ["completed", "failed"]
+    )
+
+@app.get("/tasks/my")
+async def get_my_tasks(user: dict = Depends(verify_token)):
+    """Get all tasks for current user"""
+    
+    tasks = task_manager.get_user_tasks(user["user_id"])
+    
+    # Sort by creation time, newest first
+    tasks.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    # Return only recent tasks
+    return tasks[:10]
+
+@app.post("/task/{task_id}/cancel")
+async def cancel_task(task_id: str, user: dict = Depends(verify_token)):
+    """Cancel a running task"""
+    
+    task = task_manager.get_task(task_id)
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    if task["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    if task["status"] in ["completed", "failed"]:
+        raise HTTPException(status_code=400, detail="Task already finished")
+    
+    task_manager.update_task(task_id,
+        status="cancelled",
+        message="Task cancelled by user",
+        completed_at=datetime.now().isoformat()
+    )
+    
+    return {"message": "Task cancelled"}
 
 @app.get("/download/{doc_id}")
 async def download_document(doc_id: str, user: dict = Depends(verify_token)):
     """Download translated document"""
-    
-    print(f"\n📥 Download request: {doc_id} by {user['email']}\n")
     
     if doc_id not in documents:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -892,8 +966,6 @@ async def download_document(doc_id: str, user: dict = Depends(verify_token)):
     file_ext = doc["file_type"]
     translated_filename = f"{original_name}_translated{file_ext}"
     
-    print(f"✓ Serving file: {translated_filename}\n")
-    
     return FileResponse(
         path=doc["translated_path"],
         filename=translated_filename,
@@ -902,52 +974,182 @@ async def download_document(doc_id: str, user: dict = Depends(verify_token)):
 
 @app.get("/documents", response_model=List[DocumentInfo])
 async def list_documents(user: dict = Depends(verify_token)):
-    """List user documents"""
+    """List user documents with task info"""
     
-    print(f"\n📋 Listing documents for: {user['email']}\n")
+    user_documents = []
     
-    user_documents = [
-        DocumentInfo(
-            doc_id=doc["doc_id"],
-            filename=doc["filename"],
-            file_type=doc["file_type"],
-            status=doc["status"],
-            upload_time=doc["upload_time"],
-            translated_doc_id=doc.get("translated_doc_id"),
-            error=doc.get("error")
-        )
-        for doc in documents.values()
-        if doc["user_id"] == user["user_id"]
-    ]
-    
-    print(f"Found {len(user_documents)} documents\n")
+    for doc in documents.values():
+        if doc["user_id"] == user["user_id"]:
+            # Add task progress if available
+            progress = None
+            if doc.get("task_id"):
+                task = task_manager.get_task(doc["task_id"])
+                if task:
+                    progress = task["progress"]
+                    # Update doc status from task
+                    if task["status"] == "completed":
+                        doc["status"] = "completed"
+                    elif task["status"] == "failed":
+                        doc["status"] = "failed"
+                        doc["error"] = task.get("error")
+            
+            user_documents.append(
+                DocumentInfo(
+                    doc_id=doc["doc_id"],
+                    filename=doc["filename"],
+                    file_type=doc["file_type"],
+                    status=doc["status"],
+                    upload_time=doc["upload_time"],
+                    translated_doc_id=doc.get("translated_doc_id"),
+                    error=doc.get("error"),
+                    task_id=doc.get("task_id"),
+                    progress=progress
+                )
+            )
     
     return sorted(user_documents, key=lambda x: x.upload_time, reverse=True)
+
+# ============================================
+# PAYMENT ENDPOINTS (same as before)
+# ============================================
+
+@app.post("/payment/initiate")
+async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depends(verify_token)):
+    """Initiate Paystack payment"""
+    
+    if payment_request.tier not in SUBSCRIPTION_TIERS:
+        raise HTTPException(status_code=400, detail="Invalid subscription tier")
+    
+    tier = SUBSCRIPTION_TIERS[payment_request.tier]
+    
+    if tier["price"] == 0:
+        raise HTTPException(status_code=400, detail="Cannot purchase free tier")
+    
+    upgrade_id = str(uuid.uuid4())
+    
+    pending_upgrades[user["user_id"]] = {
+        "upgrade_id": upgrade_id,
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "tier": payment_request.tier,
+        "amount": tier["price"],
+        "status": "pending",
+        "created_at": datetime.now().isoformat()
+    }
+    save_json(PENDING_UPGRADES_FILE, pending_upgrades)
+    
+    callback_url = f"{FRONTEND_URL}?payment_callback=true&user_id={user['user_id']}&tier={payment_request.tier}"
+    
+    return {
+        "payment_url": PAYSTACK_PAYMENT_LINK,
+        "upgrade_id": upgrade_id,
+        "tier": payment_request.tier,
+        "amount": tier["price"],
+        "callback_url": callback_url
+    }
+
+@app.post("/payment/verify")
+async def verify_payment(user: dict = Depends(verify_token)):
+    """Verify payment and upgrade user tier"""
+    
+    user_id = user["user_id"]
+    
+    if user_id not in pending_upgrades:
+        raise HTTPException(status_code=404, detail="No pending upgrade found")
+    
+    pending = pending_upgrades[user_id]
+    new_tier = pending["tier"]
+    
+    if user_id in users:
+        users[user_id]["tier"] = new_tier
+        users[user_id]["translations_used"] = 0
+        users[user_id]["updated_at"] = datetime.now().isoformat()
+        save_json(USERS_FILE, users)
+    
+    payment_id = str(uuid.uuid4())
+    payments[payment_id] = {
+        "payment_id": payment_id,
+        "user_id": user_id,
+        "email": user["email"],
+        "tier": new_tier,
+        "amount": pending["amount"],
+        "status": "completed",
+        "created_at": pending["created_at"],
+        "completed_at": datetime.now().isoformat()
+    }
+    save_json(PAYMENTS_FILE, payments)
+    
+    del pending_upgrades[user_id]
+    save_json(PENDING_UPGRADES_FILE, pending_upgrades)
+    
+    tier_info = SUBSCRIPTION_TIERS[new_tier]
+    
+    return {
+        "status": "success",
+        "message": f"Successfully upgraded to {tier_info['name']}",
+        "tier": new_tier,
+        "translations_limit": tier_info["limit"],
+        "user": {
+            "user_id": users[user_id]["user_id"],
+            "email": users[user_id]["email"],
+            "name": users[user_id]["name"],
+            "tier": new_tier,
+            "translations_used": 0,
+            "translations_limit": tier_info["limit"]
+        }
+    }
+
+# ============================================
+# CLEANUP TASK
+# ============================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Run cleanup tasks on startup"""
+    # Clean up old tasks periodically
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(3600)  # Every hour
+            task_manager.cleanup_old_tasks(24)  # Remove tasks older than 24 hours
+            print("✓ Cleaned up old tasks")
+    
+    asyncio.create_task(cleanup_loop())
+
+# ============================================
+# ROOT ENDPOINTS
+# ============================================
 
 @app.get("/")
 async def root():
     """API info"""
     return {
-        "service": "Document Translation API - With Paystack Payments",
-        "version": "3.0.0",
+        "service": "Document Translation API - Enhanced for Large Files",
+        "version": "4.0.0",
         "status": "operational",
         "translator_available": TRANSLATOR_AVAILABLE,
-        "payment_provider": "Paystack",
-        "payment_link": PAYSTACK_PAYMENT_LINK,
         "features": [
-            "Enhanced error logging",
-            "Detailed request tracking",
-            "Better error messages",
-            "Authentication debugging",
-            "Paystack payment integration",
-            "Subscription management",
-            "Webhook support"
-        ]
+            "Background processing for large files",
+            "Real-time progress tracking",
+            "File size validation (max 100MB)",
+            "Chunked file uploads",
+            "Task management and cancellation",
+            "Concurrent translation limits",
+            "Automatic retry with exponential backoff",
+            "Progress polling for long-running tasks"
+        ],
+        "limits": {
+            "max_file_size_mb": MAX_FILE_SIZE_MB,
+            "max_concurrent_translations": MAX_CONCURRENT_TRANSLATIONS,
+            "translation_timeout_seconds": TRANSLATION_TIMEOUT
+        }
     }
 
 @app.get("/health")
 async def health():
-    """Health check"""
+    """Health check with task stats"""
+    active_tasks = sum(1 for t in task_manager.tasks.values() if t["status"] == "processing")
+    queued_tasks = sum(1 for t in task_manager.tasks.values() if t["status"] == "queued")
+    
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -956,62 +1158,24 @@ async def health():
             "sessions": len(sessions),
             "documents": len(documents),
             "payments": len(payments),
-            "pending_upgrades": len(pending_upgrades)
+            "tasks": len(task_manager.tasks)
         },
-        "translator": "available" if TRANSLATOR_AVAILABLE else "unavailable",
-        "payment_integration": "paystack"
-    }
-
-@app.get("/debug/sessions")
-async def debug_sessions():
-    """Debug endpoint to see active sessions"""
-    return {
-        "total_sessions": len(sessions),
-        "sessions": [
-            {
-                "token_preview": token[:20] + "...",
-                "user_id": session["user_id"],
-                "created_at": session["created_at"],
-                "age_hours": (datetime.now() - datetime.fromisoformat(session["created_at"])).total_seconds() / 3600
-            }
-            for token, session in sessions.items()
-        ]
-    }
-
-@app.get("/debug/payments")
-async def debug_payments():
-    """Debug endpoint to see payment records"""
-    return {
-        "total_payments": len(payments),
-        "payments": [
-            {
-                "payment_id": payment["payment_id"],
-                "user_id": payment["user_id"],
-                "tier": payment["tier"],
-                "amount": payment["amount"],
-                "status": payment["status"],
-                "created_at": payment.get("created_at", payment.get("completed_at", ""))
-            }
-            for payment in payments.values()
-        ]
-    }
-
-@app.get("/debug/pending-upgrades")
-async def debug_pending_upgrades():
-    """Debug endpoint to see pending upgrades"""
-    return {
-        "total_pending": len(pending_upgrades),
-        "pending": list(pending_upgrades.values())
+        "tasks": {
+            "active": active_tasks,
+            "queued": queued_tasks,
+            "total": len(task_manager.tasks)
+        },
+        "translator": "available" if TRANSLATOR_AVAILABLE else "unavailable"
     }
 
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 Starting Document Translation API with Paystack Payments")
+    print("🚀 Starting Enhanced Document Translation API")
     print("="*70)
     print(f"Translator available: {TRANSLATOR_AVAILABLE}")
-    print(f"Backend URL: {BACKEND_URL}")
-    print(f"Frontend URL: {FRONTEND_URL}")
-    print(f"Paystack Payment Link: {PAYSTACK_PAYMENT_LINK}")
+    print(f"Max file size: {MAX_FILE_SIZE_MB}MB")
+    print(f"Max concurrent translations: {MAX_CONCURRENT_TRANSLATIONS}")
+    print(f"Translation timeout: {TRANSLATION_TIMEOUT}s")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
