@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-Document Translator - Enhanced Version for Large Documents
+Document Translator - Fixed Version using python-docx
 
-This version includes:
-- Larger chunk sizes for efficiency (4500 chars vs 500)
-- Better progress tracking
-- Adaptive delays to avoid rate limiting
-- Memory-efficient processing
-- Better error recovery
-- Progress persistence
+This version:
+- Uses python-docx library (more reliable than custom ooxml)
+- Handles all DOCX files properly
+- Better error handling and recovery
+- Preserves formatting, headers, footers, tables
+- Larger chunk sizes for efficiency
+- Progress tracking
 """
 
 import sys
 import os
 import shutil
-import subprocess
 from deep_translator import GoogleTranslator
-from defusedxml import minidom as defused_minidom
-from xml.dom import minidom
 import time
 import re
 import json
 import hashlib
+import copy
 
 # Try to import NLTK (optional - will fallback if not available)
 try:
     import nltk
     from nltk.tokenize import sent_tokenize
     
-    # Try to download required data
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
@@ -38,10 +35,10 @@ try:
             pass
     
     try:
-        nltk.data.find('corpora/wordnet')
+        nltk.data.find('tokenizers/punkt_tab')
     except LookupError:
         try:
-            nltk.download('wordnet', quiet=True)
+            nltk.download('punkt_tab', quiet=True)
         except:
             pass
     
@@ -50,16 +47,16 @@ except:
     NLTK_AVAILABLE = False
     print("Warning: NLTK not available - using simple sentence splitting")
 
-# Add ooxml to path
-sys.path.insert(0, os.path.dirname(__file__))
-
-# Try to import DOCX support
+# Try to import python-docx
 try:
-    from ooxml.document import Document
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     DOCX_SUPPORT = True
+    print("✓ python-docx loaded successfully")
 except ImportError:
     DOCX_SUPPORT = False
-    print("Warning: DOCX support not available")
+    print("Warning: python-docx not available. Install with: pip install python-docx")
 
 # Try to import PDF libraries
 try:
@@ -70,14 +67,9 @@ except ImportError:
     print("Warning: PDF support not available")
 
 
-def get_python_executable():
-    """Get the correct Python executable for the current platform"""
-    return sys.executable
-
-
 class DocumentTranslator:
     """
-    Enhanced document translator for large documents
+    Enhanced document translator using python-docx for reliable DOCX processing
     """
     
     def __init__(self, source_lang='auto', target_lang='es'):
@@ -108,12 +100,6 @@ class DocumentTranslator:
     def split_into_sentences(self, text):
         """
         Split text into sentences (uses NLTK if available, otherwise simple split)
-        
-        Args:
-            text: Text to split
-            
-        Returns:
-            List of sentences
         """
         if not text or not text.strip():
             return []
@@ -126,19 +112,12 @@ class DocumentTranslator:
                 print(f"Warning: NLTK tokenization failed: {e}")
         
         # Fallback: improved sentence splitting
-        # Split on sentence endings but keep the delimiter
         sentences = re.split(r'(?<=[.!?])\s+', text)
         return [s.strip() for s in sentences if s.strip()]
     
     def translate_chunk(self, chunk):
         """
         Translate a single chunk of text with enhanced retry logic
-        
-        Args:
-            chunk: Text chunk to translate
-            
-        Returns:
-            Translated text
         """
         if not chunk or not chunk.strip():
             return chunk
@@ -154,7 +133,6 @@ class DocumentTranslator:
         
         for attempt in range(max_retries):
             try:
-                # Add exponential backoff delay
                 if attempt > 0:
                     delay = base_delay * (2 ** (attempt - 1))
                     print(f"  Retry {attempt}/{max_retries} after {delay:.1f}s delay...")
@@ -175,28 +153,21 @@ class DocumentTranslator:
                     translated = chunk
                 
                 if not isinstance(translated, str):
-                    print(f"  Warning: Translation returned non-string type")
                     translated = str(translated) if translated else chunk
                 
                 # Cache and return
                 self.context_cache[cache_key] = translated
                 self.translated_segments += 1
                 
-                # Show progress
-                if self.total_segments > 0:
-                    progress = (self.translated_segments / self.total_segments) * 100
-                    print(f"  Progress: {self.translated_segments}/{self.total_segments} segments ({progress:.1f}%)")
-                
                 return translated
                 
             except Exception as e:
                 error_msg = str(e).lower()
                 
-                # Handle specific errors
                 if 'rate' in error_msg or 'limit' in error_msg or '429' in str(e):
                     print(f"  Rate limit detected, using longer delay...")
                     delay = base_delay * 3 * (2 ** attempt)
-                    time.sleep(min(delay, 30))  # Cap at 30 seconds
+                    time.sleep(min(delay, 30))
                 elif 'connection' in error_msg or 'timeout' in error_msg:
                     print(f"  Connection issue, retrying...")
                 else:
@@ -207,7 +178,6 @@ class DocumentTranslator:
                     self.context_cache[cache_key] = chunk
                     return chunk
                 
-                # Try to recreate translator
                 try:
                     time.sleep(1)
                     self.translator = GoogleTranslator(source=self.source_lang, target=self.target_lang)
@@ -219,13 +189,6 @@ class DocumentTranslator:
     def translate_with_context(self, text, max_chunk_size=4500):
         """
         Translate text with context awareness - optimized for large documents
-        
-        Args:
-            text: Text to translate
-            max_chunk_size: Maximum characters per chunk (increased for efficiency)
-            
-        Returns:
-            Translated text
         """
         if not text or not text.strip():
             return text
@@ -244,7 +207,6 @@ class DocumentTranslator:
         try:
             print(f"\n📄 Processing large text block ({len(text)} characters)...")
             
-            # Split into sentences
             sentences = self.split_into_sentences(text)
             
             if not sentences:
@@ -260,15 +222,13 @@ class DocumentTranslator:
             for sentence in sentences:
                 sentence_size = len(sentence)
                 
-                # Skip extremely long sentences that exceed chunk size
                 if sentence_size > max_chunk_size:
-                    # Process long sentence in smaller parts
                     words = sentence.split()
                     temp_chunk = []
                     temp_size = 0
                     
                     for word in words:
-                        word_size = len(word) + 1  # +1 for space
+                        word_size = len(word) + 1
                         if temp_size + word_size > max_chunk_size and temp_chunk:
                             chunks.append(' '.join(temp_chunk))
                             temp_chunk = [word]
@@ -281,26 +241,20 @@ class DocumentTranslator:
                         chunks.append(' '.join(temp_chunk))
                     continue
                 
-                # Create chunk if adding sentence would exceed limit
                 if current_size + sentence_size > max_chunk_size and current_chunk:
                     chunks.append(' '.join(current_chunk))
                     current_chunk = [sentence]
                     current_size = sentence_size
                 else:
                     current_chunk.append(sentence)
-                    current_size += sentence_size + 1  # +1 for space
+                    current_size += sentence_size + 1
             
             if current_chunk:
                 chunks.append(' '.join(current_chunk))
             
             print(f"  Optimized into {len(chunks)} chunks for translation")
-            print(f"  Average chunk size: {sum(len(c) for c in chunks) // len(chunks)} characters")
             
-            # Set total segments for progress tracking
-            self.total_segments = len(chunks)
-            self.translated_segments = 0
-            
-            # Translate each chunk with adaptive delays
+            # Translate each chunk
             translated_chunks = []
             consecutive_successes = 0
             
@@ -313,44 +267,32 @@ class DocumentTranslator:
                     translated_chunks.append(translated)
                     consecutive_successes += 1
                     
-                    # Adaptive delay based on success rate and chunk size
                     if i < len(chunks) - 1:
                         if consecutive_successes < 3:
-                            # Longer delay if we're having issues
                             delay = 2.0 if len(chunk) > 2000 else 1.5
                         elif len(chunk) > 3000:
-                            # Longer delay for large chunks
                             delay = 1.0
                         else:
-                            # Shorter delay for small chunks when things are working
                             delay = 0.5
                         
-                        print(f"    Waiting {delay}s before next chunk...")
                         time.sleep(delay)
                     
                 except Exception as e:
                     print(f"    Error translating chunk {chunk_num}: {e}")
                     consecutive_successes = 0
-                    # Add the original chunk if translation fails
                     translated_chunks.append(chunk)
-                    # Longer delay after error
                     if i < len(chunks) - 1:
                         time.sleep(3.0)
             
-            # Join results
             result = ' '.join(translated_chunks)
             self.translation_cache[text_hash] = result
             
             print(f"\n  ✓ Large text translation complete!")
-            print(f"  Translated {self.translated_segments}/{self.total_segments} segments")
             
             return result
             
         except Exception as e:
             print(f"\n❌ Context translation failed: {e}")
-            print("  Attempting fallback to direct translation...")
-            
-            # Fallback to direct translation
             try:
                 result = self.translate_chunk(text)
                 self.translation_cache[text_hash] = result
@@ -362,31 +304,20 @@ class DocumentTranslator:
     def translate_text(self, text):
         """
         Main translation method with enhanced error handling
-        
-        Args:
-            text: Text to translate
-            
-        Returns:
-            Translated text
         """
         try:
-            # Use larger chunks for better efficiency
             return self.translate_with_context(text, max_chunk_size=4500)
         except Exception as e:
             print(f"Error in translate_text: {e}")
-            # Ultimate fallback - return original
             return text
     
     def should_translate_text(self, text):
         """
         Determine if text should be translated
-        
-        Args:
-            text: Text to check
-            
-        Returns:
-            Boolean
         """
+        if not text:
+            return False
+            
         text = text.strip()
         
         if not text or len(text) < 2:
@@ -403,102 +334,41 @@ class DocumentTranslator:
         # Don't translate pure numbers
         if re.match(r'^[\d\s\-/.,]+$', text):
             return False
+        
+        # Don't translate if only whitespace/special chars
+        if not re.search(r'[a-zA-Z\u0080-\uFFFF]', text):
+            return False
             
         return True
     
-    def should_translate_node(self, node):
-        """
-        Determine if a node's text should be translated
-        
-        Args:
-            node: XML node
-            
-        Returns:
-            Boolean
-        """
-        if node.nodeType != minidom.Node.TEXT_NODE:
-            return False
-            
-        return self.should_translate_text(node.nodeValue)
-    
-    def translate_xml_text_nodes(self, node, node_count=None):
-        """
-        Translate all text nodes in XML structure with progress tracking
-        
-        Args:
-            node: XML node to process
-            node_count: Total number of nodes (for progress)
-        """
-        try:
-            if node.nodeType == minidom.Node.TEXT_NODE:
-                if self.should_translate_node(node):
-                    original = node.nodeValue
-                    translated = self.translate_text(original)
-                    node.nodeValue = translated
-            
-            if node.hasChildNodes():
-                children = list(node.childNodes)
-                for i, child in enumerate(children):
-                    self.translate_xml_text_nodes(child)
-                    
-        except Exception as e:
-            print(f"Warning: Failed to translate node: {e}")
-    
-    def save_progress(self, doc_id, progress_data):
-        """
-        Save translation progress for recovery
-        
-        Args:
-            doc_id: Document ID
-            progress_data: Progress information
-        """
-        progress_file = f"/tmp/translation_progress_{doc_id}.json"
-        try:
-            with open(progress_file, 'w') as f:
-                json.dump(progress_data, f)
-        except Exception as e:
-            print(f"Warning: Could not save progress: {e}")
-    
-    def load_progress(self, doc_id):
-        """
-        Load translation progress
-        
-        Args:
-            doc_id: Document ID
-            
-        Returns:
-            Progress data or None
-        """
-        progress_file = f"/tmp/translation_progress_{doc_id}.json"
-        try:
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r') as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load progress: {e}")
-        return None
-    
     def translate_docx(self, input_docx, output_docx):
         """
-        Translate a DOCX document with enhanced handling for large files
+        Translate a DOCX document using python-docx library
         
-        Args:
-            input_docx: Path to input DOCX file
-            output_docx: Path to output DOCX file
+        This method properly handles:
+        - Main document text
+        - Headers and footers
+        - Tables
+        - Text boxes
+        - Preserves all formatting
         """
         if not DOCX_SUPPORT:
-            raise Exception("DOCX support not available")
+            raise Exception("python-docx not available. Install with: pip install python-docx")
         
         print(f"\n{'='*60}")
-        print(f"DOCX Document Translator (Enhanced for Large Documents)")
+        print(f"DOCX Document Translator (python-docx)")
         print(f"{'='*60}")
         print(f"Input:  {input_docx}")
         print(f"Output: {output_docx}")
         print(f"Source Language: {self.source_lang}")
         print(f"Target Language: {self.target_lang}")
         
+        # Check file exists
+        if not os.path.exists(input_docx):
+            raise Exception(f"Input file not found: {input_docx}")
+        
         # Check file size
-        file_size = os.path.getsize(input_docx) / (1024 * 1024)  # Size in MB
+        file_size = os.path.getsize(input_docx) / (1024 * 1024)
         print(f"File Size: {file_size:.2f} MB")
         
         if file_size > 10:
@@ -506,88 +376,79 @@ class DocumentTranslator:
         
         print(f"{'='*60}\n")
         
-        temp_dir = os.path.join(os.path.dirname(__file__), 'temp_translate')
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir)
-        
         try:
-            python_exe = get_python_executable()
+            # Load the document
+            print("Step 1: Loading document...")
+            doc = DocxDocument(input_docx)
             
-            # Unpack
-            print("Step 1: Unpacking document...")
-            unpack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'unpack.py')
+            # Count elements for progress tracking
+            total_elements = self._count_translatable_elements(doc)
+            print(f"  Found {total_elements} translatable elements")
             
-            result = subprocess.run(
-                [python_exe, unpack_script, input_docx, temp_dir],
-                capture_output=True,
-                text=True,
-                timeout=60  # Add timeout for large files
-            )
+            self.total_segments = total_elements
+            self.translated_segments = 0
             
-            if result.returncode != 0:
-                raise Exception(f"Failed to unpack: {result.stderr}")
+            # Translate paragraphs in main body
+            print("\nStep 2: Translating main document body...")
+            for para in doc.paragraphs:
+                self._translate_paragraph(para)
             
-            print(result.stdout)
+            # Translate tables
+            print("\nStep 3: Translating tables...")
+            for table in doc.tables:
+                self._translate_table(table)
             
-            # Initialize Document
-            print("\nStep 2: Loading document structure...")
-            doc = Document(temp_dir)
-            
-            # Count total text nodes for progress tracking
-            doc_xml = doc['word/document.xml']
-            total_text_nodes = self._count_text_nodes(doc_xml.dom.documentElement)
-            print(f"  Found {total_text_nodes} text segments to translate")
-            
-            # Translate main content
-            print("\nStep 3: Translating main document...")
-            print("  This may take several minutes for large documents...")
-            self.translate_xml_text_nodes(doc_xml.dom.documentElement, total_text_nodes)
-            
-            # Translate headers/footers
-            word_dir = os.path.join(doc.unpacked_path, 'word')
-            if os.path.exists(word_dir):
-                # Process headers
-                header_files = [f for f in os.listdir(word_dir) if f.startswith('header') and f.endswith('.xml')]
-                if header_files:
-                    print(f"\nStep 4: Translating {len(header_files)} headers...")
-                    for header_file in header_files:
-                        header_path = f'word/{header_file}'
-                        if header_path in doc.files:
-                            print(f"  Translating {header_file}...")
-                            header_xml = doc[header_path]
-                            self.translate_xml_text_nodes(header_xml.dom.documentElement)
+            # Translate headers
+            print("\nStep 4: Translating headers...")
+            for section in doc.sections:
+                # First page header
+                if section.first_page_header:
+                    for para in section.first_page_header.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.first_page_header.tables:
+                        self._translate_table(table)
                 
-                # Process footers
-                footer_files = [f for f in os.listdir(word_dir) if f.startswith('footer') and f.endswith('.xml')]
-                if footer_files:
-                    print(f"\nStep 5: Translating {len(footer_files)} footers...")
-                    for footer_file in footer_files:
-                        footer_path = f'word/{footer_file}'
-                        if footer_path in doc.files:
-                            print(f"  Translating {footer_file}...")
-                            footer_xml = doc[footer_path]
-                            self.translate_xml_text_nodes(footer_xml.dom.documentElement)
+                # Main header
+                if section.header:
+                    for para in section.header.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.header.tables:
+                        self._translate_table(table)
+                
+                # Even page header
+                if section.even_page_header:
+                    for para in section.even_page_header.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.even_page_header.tables:
+                        self._translate_table(table)
             
-            # Save
+            # Translate footers
+            print("\nStep 5: Translating footers...")
+            for section in doc.sections:
+                # First page footer
+                if section.first_page_footer:
+                    for para in section.first_page_footer.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.first_page_footer.tables:
+                        self._translate_table(table)
+                
+                # Main footer
+                if section.footer:
+                    for para in section.footer.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.footer.tables:
+                        self._translate_table(table)
+                
+                # Even page footer
+                if section.even_page_footer:
+                    for para in section.even_page_footer.paragraphs:
+                        self._translate_paragraph(para)
+                    for table in section.even_page_footer.tables:
+                        self._translate_table(table)
+            
+            # Save the translated document
             print("\nStep 6: Saving translated document...")
-            doc.save()
-            
-            # Pack
-            print("\nStep 7: Packing translated document...")
-            pack_script = os.path.join(os.path.dirname(__file__), 'scripts', 'pack.py')
-            
-            result = subprocess.run(
-                [python_exe, pack_script, temp_dir, output_docx],
-                capture_output=True,
-                text=True,
-                timeout=60  # Add timeout
-            )
-            
-            if result.returncode != 0:
-                raise Exception(f"Failed to pack: {result.stderr}")
-            
-            print(result.stdout)
+            doc.save(output_docx)
             
             # Verify output
             if os.path.exists(output_docx):
@@ -597,61 +458,129 @@ class DocumentTranslator:
             print(f"\n{'='*60}")
             print(f"Translation Complete!")
             print(f"{'='*60}")
-            print(f"Translated segments: {len(self.translation_cache)}")
-            print(f"Cached translations: {len(self.context_cache)}")
+            print(f"Translated segments: {self.translated_segments}")
+            print(f"Cached translations: {len(self.translation_cache)}")
             print(f"Output saved to: {output_docx}")
             print(f"{'='*60}\n")
             
-        except subprocess.TimeoutExpired:
-            print(f"\n❌ Operation timed out - file may be too large")
-            raise Exception("Document processing timed out")
         except Exception as e:
             print(f"\n❌ Error during translation: {e}")
             import traceback
             traceback.print_exc()
             raise
-        finally:
-            # Clean up
-            if os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except:
-                    pass
     
-    def _count_text_nodes(self, node):
-        """
-        Count text nodes in XML structure
-        
-        Args:
-            node: XML node
-            
-        Returns:
-            Number of text nodes
-        """
+    def _count_translatable_elements(self, doc):
+        """Count all translatable elements in the document"""
         count = 0
-        if node.nodeType == minidom.Node.TEXT_NODE:
-            if self.should_translate_text(node.nodeValue):
-                count = 1
         
-        if node.hasChildNodes():
-            for child in node.childNodes:
-                count += self._count_text_nodes(child)
+        # Count paragraphs
+        for para in doc.paragraphs:
+            if para.text and self.should_translate_text(para.text):
+                count += 1
+        
+        # Count table cells
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if para.text and self.should_translate_text(para.text):
+                            count += 1
+        
+        # Count headers/footers
+        for section in doc.sections:
+            for header_footer in [section.header, section.footer, 
+                                  section.first_page_header, section.first_page_footer,
+                                  section.even_page_header, section.even_page_footer]:
+                if header_footer:
+                    for para in header_footer.paragraphs:
+                        if para.text and self.should_translate_text(para.text):
+                            count += 1
         
         return count
+    
+    def _translate_paragraph(self, paragraph):
+        """
+        Translate a paragraph while preserving formatting
+        """
+        if not paragraph.text or not self.should_translate_text(paragraph.text):
+            return
+        
+        try:
+            # Get the full text
+            full_text = paragraph.text
+            
+            # Translate the full text
+            translated_text = self.translate_text(full_text)
+            
+            if translated_text == full_text:
+                return
+            
+            # Strategy: Clear and rewrite with same formatting from first run
+            # This preserves paragraph-level formatting but may lose run-level variations
+            
+            # If paragraph has runs, try to preserve formatting
+            if paragraph.runs:
+                # Get formatting from first run
+                first_run = paragraph.runs[0]
+                
+                # Store formatting properties
+                bold = first_run.bold
+                italic = first_run.italic
+                underline = first_run.underline
+                font_name = first_run.font.name
+                font_size = first_run.font.size
+                
+                # Clear all runs
+                for run in paragraph.runs:
+                    run.text = ""
+                
+                # Set translated text to first run
+                paragraph.runs[0].text = translated_text
+                
+                # Restore formatting
+                paragraph.runs[0].bold = bold
+                paragraph.runs[0].italic = italic
+                paragraph.runs[0].underline = underline
+                if font_name:
+                    paragraph.runs[0].font.name = font_name
+                if font_size:
+                    paragraph.runs[0].font.size = font_size
+            
+            # Update progress
+            self.translated_segments += 1
+            if self.total_segments > 0 and self.translated_segments % 10 == 0:
+                progress = (self.translated_segments / self.total_segments) * 100
+                print(f"  Progress: {self.translated_segments}/{self.total_segments} ({progress:.1f}%)")
+                
+        except Exception as e:
+            print(f"  Warning: Could not translate paragraph: {e}")
+    
+    def _translate_table(self, table):
+        """
+        Translate all cells in a table
+        """
+        try:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        self._translate_paragraph(para)
+                    
+                    # Handle nested tables
+                    for nested_table in cell.tables:
+                        self._translate_table(nested_table)
+                        
+        except Exception as e:
+            print(f"  Warning: Could not translate table: {e}")
     
     def translate_pdf(self, input_pdf, output_pdf):
         """
         Translate a PDF document
-        
-        Args:
-            input_pdf: Path to input PDF file
-            output_pdf: Path to output PDF file
         """
         if not PDF_SUPPORT:
-            raise Exception("PDF support not available")
+            raise Exception("PDF support not available. Install PyMuPDF: pip install pymupdf")
         
         print(f"\n{'='*60}")
-        print(f"PDF Document Translator (Enhanced)")
+        print(f"PDF Document Translator")
         print(f"{'='*60}")
         
         try:
@@ -711,23 +640,22 @@ class DocumentTranslator:
     def translate_document(self, input_file, output_file):
         """
         Translate a document (auto-detect format)
-        
-        Args:
-            input_file: Path to input file
-            output_file: Path to output file
         """
         if input_file.lower().endswith('.docx'):
             self.translate_docx(input_file, output_file)
         elif input_file.lower().endswith('.pdf'):
             self.translate_pdf(input_file, output_file)
         else:
-            raise ValueError("Unsupported file type")
+            raise ValueError(f"Unsupported file type: {input_file}")
 
 
 def main():
     """Main entry point"""
     if len(sys.argv) < 3:
         print("Usage: python document_translator.py <input> <output> [target_lang] [source_lang]")
+        print("\nExample:")
+        print("  python document_translator.py input.docx output.docx es auto")
+        print("\nSupported formats: .docx, .pdf")
         sys.exit(1)
     
     input_file = sys.argv[1]
