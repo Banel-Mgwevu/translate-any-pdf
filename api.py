@@ -9,6 +9,7 @@ Key improvements:
 5. Translation queue management
 6. Better error recovery
 7. Chunked file uploads for large documents
+8. Multiple payment tier support (Professional & Enterprise)
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Depends, Query
@@ -64,8 +65,11 @@ CHUNK_SIZE_KB = 1024  # Chunk size for reading large files
 TRANSLATION_TIMEOUT = 1800  # 30 minutes timeout for translation
 MAX_CONCURRENT_TRANSLATIONS = 3  # Max translations running at once
 
-# Paystack Configuration
-PAYSTACK_PAYMENT_LINK = "https://paystack.shop/pay/8zcv4xhc7r"
+# Paystack Configuration - Multiple Payment Links for Different Tiers
+PAYSTACK_PAYMENT_LINKS = {
+    "professional": "https://paystack.shop/pay/8zcv4xhc7r",  # R20/month
+    "enterprise": "https://paystack.shop/pay/e6i2wk1lnn"     # R999/month
+}
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
 
 # ============================================
@@ -321,6 +325,10 @@ def get_file_extension(filename: str) -> str:
 
 def is_supported_format(filename: str) -> bool:
     return get_file_extension(filename) in SUPPORTED_FORMATS
+
+def get_payment_link(tier: str) -> str:
+    """Get the correct Paystack payment link for a tier"""
+    return PAYSTACK_PAYMENT_LINKS.get(tier, PAYSTACK_PAYMENT_LINKS["professional"])
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """Verify authentication token"""
@@ -1010,12 +1018,12 @@ async def list_documents(user: dict = Depends(verify_token)):
     return sorted(user_documents, key=lambda x: x.upload_time, reverse=True)
 
 # ============================================
-# PAYMENT ENDPOINTS (same as before)
+# PAYMENT ENDPOINTS - UPDATED FOR MULTIPLE TIERS
 # ============================================
 
 @app.post("/payment/initiate")
 async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depends(verify_token)):
-    """Initiate Paystack payment"""
+    """Initiate Paystack payment for Professional or Enterprise tier"""
     
     if payment_request.tier not in SUBSCRIPTION_TIERS:
         raise HTTPException(status_code=400, detail="Invalid subscription tier")
@@ -1025,8 +1033,13 @@ async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depend
     if tier["price"] == 0:
         raise HTTPException(status_code=400, detail="Cannot purchase free tier")
     
+    # Validate tier has a payment link
+    if payment_request.tier not in PAYSTACK_PAYMENT_LINKS:
+        raise HTTPException(status_code=400, detail=f"No payment link configured for {payment_request.tier} tier")
+    
     upgrade_id = str(uuid.uuid4())
     
+    # Store pending upgrade info
     pending_upgrades[user["user_id"]] = {
         "upgrade_id": upgrade_id,
         "user_id": user["user_id"],
@@ -1038,10 +1051,22 @@ async def initiate_payment(payment_request: PaymentInitiate, user: dict = Depend
     }
     save_json(PENDING_UPGRADES_FILE, pending_upgrades)
     
+    # Get the correct payment link for the tier
+    payment_url = get_payment_link(payment_request.tier)
+    
     callback_url = f"{FRONTEND_URL}?payment_callback=true&user_id={user['user_id']}&tier={payment_request.tier}"
     
+    print(f"\n{'='*70}")
+    print(f"💳 PAYMENT INITIATED")
+    print(f"{'='*70}")
+    print(f"User:    {user['email']}")
+    print(f"Tier:    {payment_request.tier}")
+    print(f"Amount:  R{tier['price']}")
+    print(f"URL:     {payment_url}")
+    print(f"{'='*70}\n")
+    
     return {
-        "payment_url": PAYSTACK_PAYMENT_LINK,
+        "payment_url": payment_url,
         "upgrade_id": upgrade_id,
         "tier": payment_request.tier,
         "amount": tier["price"],
@@ -1060,12 +1085,18 @@ async def verify_payment(user: dict = Depends(verify_token)):
     pending = pending_upgrades[user_id]
     new_tier = pending["tier"]
     
+    # Validate tier
+    if new_tier not in SUBSCRIPTION_TIERS:
+        raise HTTPException(status_code=400, detail="Invalid tier in pending upgrade")
+    
+    # Update user tier
     if user_id in users:
         users[user_id]["tier"] = new_tier
-        users[user_id]["translations_used"] = 0
+        users[user_id]["translations_used"] = 0  # Reset usage on upgrade
         users[user_id]["updated_at"] = datetime.now().isoformat()
         save_json(USERS_FILE, users)
     
+    # Record payment
     payment_id = str(uuid.uuid4())
     payments[payment_id] = {
         "payment_id": payment_id,
@@ -1079,10 +1110,19 @@ async def verify_payment(user: dict = Depends(verify_token)):
     }
     save_json(PAYMENTS_FILE, payments)
     
+    # Remove pending upgrade
     del pending_upgrades[user_id]
     save_json(PENDING_UPGRADES_FILE, pending_upgrades)
     
     tier_info = SUBSCRIPTION_TIERS[new_tier]
+    
+    print(f"\n{'='*70}")
+    print(f"✅ PAYMENT VERIFIED - USER UPGRADED")
+    print(f"{'='*70}")
+    print(f"User:     {user['email']}")
+    print(f"New Tier: {new_tier}")
+    print(f"Limit:    {tier_info['limit']}")
+    print(f"{'='*70}\n")
     
     return {
         "status": "success",
@@ -1135,12 +1175,17 @@ async def root():
             "Task management and cancellation",
             "Concurrent translation limits",
             "Automatic retry with exponential backoff",
-            "Progress polling for long-running tasks"
+            "Progress polling for long-running tasks",
+            "Multiple payment tiers (Professional & Enterprise)"
         ],
         "limits": {
             "max_file_size_mb": MAX_FILE_SIZE_MB,
             "max_concurrent_translations": MAX_CONCURRENT_TRANSLATIONS,
             "translation_timeout_seconds": TRANSLATION_TIMEOUT
+        },
+        "payment_tiers": {
+            "professional": {"price": 20, "limit": 20},
+            "enterprise": {"price": 999, "limit": "unlimited"}
         }
     }
 
@@ -1176,6 +1221,9 @@ if __name__ == '__main__':
     print(f"Max file size: {MAX_FILE_SIZE_MB}MB")
     print(f"Max concurrent translations: {MAX_CONCURRENT_TRANSLATIONS}")
     print(f"Translation timeout: {TRANSLATION_TIMEOUT}s")
+    print(f"Payment links configured:")
+    for tier, url in PAYSTACK_PAYMENT_LINKS.items():
+        print(f"  - {tier}: {url}")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
